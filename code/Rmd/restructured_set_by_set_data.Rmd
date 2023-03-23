@@ -1,0 +1,665 @@
+---
+title: "Restructured tennis data"
+author: "Jake Singleton"
+date: "2023-03-16"
+output: html_document
+---
+
+```{r, message=F, warning=F}
+library(tidyverse)
+```
+
+
+We have 6 Bayesian Bradley-Terry models, Glicko-2, and a "null" ranking model for a total of 8 models to compare.
+
+First we load the relevant tennis match data:
+
+```{r}
+# Get match, player names, and rankings data
+atp_match_dat = read.csv('../../data/complete_match_info_fixed_n_months.csv', header = T, 
+                         colClasses = c("character", "character", "factor", "character", "integer", "character",  "Date", "double", "double", "integer", "integer", "integer", "integer", "integer", "integer", "integer", rep("integer", 3))) %>%
+  filter(!grepl("RET", score), !grepl("DEF", score)) %>%
+  mutate(surface = case_when(surface == "Hard" ~ 1,
+                           surface == "Clay" ~ 2,
+                           surface == "Grass" ~ 3,
+                           surface == "Carpet" ~ 1),
+         set_scores = as.vector(str_split(score, pattern = " ", n = nchar(set_order), simplify = F)))
+
+# Subset 2009 - 2017 seasons
+atp_match_dat = atp_match_dat %>%
+  filter(tourney_date >= '2009-01-01' & tourney_date <= '2017-12-31') %>%
+  mutate(week = as.numeric(tourney_date),
+         month = as.Date(paste0(strftime(tourney_date,"%Y-%m"), "-01")))
+
+names = read.csv("../../data/atp_players.csv", header = T) %>%
+  mutate(full_name = paste(name_first, name_last)) %>%
+  mutate(player_id = as.character(player_id))
+```
+
+```{r}
+head(atp_match_dat)
+```
+
+
+```{r}
+# Re-structure data to set-by-set level
+set_by_set_match_dat = atp_match_dat %>%
+  uncount(total_sets, .remove = F) %>%
+  group_by(row_num) %>%
+  mutate(set_number = row_number()) %>%
+  ungroup()
+
+# Add labels (1 if player 1, the winner, won the set, 0 else)
+labels = as.vector(str_split_fixed(paste(atp_match_dat$set_order, collapse = ""), pattern = "", n = nrow(set_by_set_match_dat)))
+set_by_set_match_dat$y = as.numeric(labels)
+
+atp_match_dat$y = NA
+
+head(set_by_set_match_dat, 21)
+```
+
+```{r}
+# Add won_previous_set feature
+set_by_set_match_dat = set_by_set_match_dat %>%
+  mutate(p1_won_previous_set = ifelse(dplyr::lag(y) == 1 & row_num == dplyr::lag(row_num), 1, 0),
+         p2_won_previous_set = ifelse(dplyr::lag(y) == 0 & row_num == dplyr::lag(row_num), 1, 0),
+         p1_won_previous_set = ifelse(is.na(p1_won_previous_set), 0, p1_won_previous_set),
+         p2_won_previous_set = ifelse(is.na(p2_won_previous_set), 0, p2_won_previous_set))
+
+set_by_set_match_dat$set_score = NA
+for (i in 1:nrow(set_by_set_match_dat)) {
+  set_by_set_match_dat[i, "set_score"] = gsub(" ", "", unlist(set_by_set_match_dat[i, "set_scores"])[[set_by_set_match_dat$set_number[i]]])
+}
+
+# Add more granular y label
+set_by_set_match_dat = set_by_set_match_dat %>%
+  mutate(y_category = case_when(set_score == "6-0" ~ 1,
+                                set_score == "6-1" ~ 2,
+                                set_score == "6-2" ~ 3,
+                                set_score == "6-3" ~ 4,
+                                set_score == "6-4" ~ 5,
+                                set_score == "7-5" ~ 6,
+                                grepl("7-6\\(\\d+\\)", set_score) ~ 7,
+                                set_score == "7-6" ~ 7,
+                                set_score == "0-6" ~ 8,
+                                set_score == "1-6" ~ 9,
+                                set_score == "2-6" ~ 10,
+                                set_score == "3-6" ~ 11,
+                                set_score == "4-6" ~ 12,
+                                set_score == "5-7" ~ 13,
+                                grepl("6-7\\(\\d+\\)", set_score) ~ 14,
+                                set_score == "6-7" ~ 14,
+                                as.numeric(sub('-.*', '', set_score)) >= 8 ~ 7)) %>%
+  drop_na(y_category)
+
+atp_match_dat$y_category = NA
+
+head(set_by_set_match_dat, 26)
+```
+
+
+```{r}
+# Gets match win probability for binomial sets model
+compute_set_win_prob_given_g = function(game_win_prob) {
+  set_win_prob = game_win_prob^6*(1 + 
+                                    6*(1-game_win_prob) + 
+                                    21*(1-game_win_prob)^2 + 
+                                    56*(1-game_win_prob)^3 + 
+                                    126*(1-game_win_prob)^4 + 
+                                    252*game_win_prob*(1-game_win_prob)^5 + 
+                                    504*(1-game_win_prob)^6*game_win_prob)
+  return(set_win_prob)
+}
+
+# Computes match win probability given set win probability and best of (3 or 5)
+compute_match_win_prob_given_s = function(set_win_prob, best_of) {
+  if (best_of == 3) {
+    match_win_prob = set_win_prob^2 + 2 * set_win_prob^2 * (1-set_win_prob) 
+  } else {  # best of 5
+    match_win_prob = set_win_prob^3*(1 + 3*(1-set_win_prob) + 6*(1-set_win_prob)^2)
+  }
+  return(match_win_prob)
+}
+
+# Whether to break loop or not
+check_for_test_matches = function(df) {
+  if (nrow(df) < 2) {
+    return("next")
+  } else {
+    return("continue")
+  }
+}
+
+# Trains Bayesian BT model
+train_bayesian_bt = function(model_file_path, test_month, max_rank, winner_y, N, time_type, model_variable) {
+  
+  # Filter players to rate
+  # players_to_rate = rankings %>%
+  #   filter(ranking_date < test_month, rank <= max_rank) %>%
+  #   pull(player) %>%
+  #   unique()
+  
+  # Split into train/test
+  # Train on matches played in the last 2 years
+  train = set_by_set_match_dat %>%
+    filter(month < test_month, as.numeric(difftime(test_month, month, unit="weeks"))/52.25 <= 2)
+  test = atp_match_dat %>%
+    filter(month == test_month)
+  
+  # Clean everything up
+  train = train %>%
+    select(winner_id, loser_id, best_of, score, set_order, winner_y, p1_won_previous_set, p2_won_previous_set, N, winner_age, loser_age, N_months_since_last_match_winner,
+           N_months_since_last_match_loser, surface, tourney_date, month, winner_rank, loser_rank)
+  test = test %>%
+    select(winner_id, loser_id, best_of, score, set_order, winner_y, N, winner_age, loser_age, N_months_since_last_match_winner,
+           N_months_since_last_match_loser, surface, tourney_date, month, winner_rank, loser_rank)
+  test$p1_won_previous_set = 0
+  test$p2_won_previous_set = 0
+  
+  print(paste("Training period:", min(train$tourney_date), "-", max(train$tourney_date)))
+  print(paste("Number of sets in training:", nrow(train)))
+  print(paste("Num players:", length(unique(c(train$winner_id, train$loser_id)))))
+  print(paste("Number of matches in testing:", nrow(test)))
+  
+  # Bind
+  train_test = rbind(train, test)
+  train_idx = (train_test$month < test_month) & as.numeric(difftime(test_month, train_test$month, unit="weeks"))/52.25 <= 2 #& (train_test$winner_id %in% players_to_rate) & (train_test$loser_id %in% players_to_rate)
+  test_idx = (train_test$month == test_month) #& (train_test$winner_id %in% players_to_rate) & (train_test$loser_id %in% players_to_rate)
+  
+  # Setup design matrices
+  N_matches = nrow(train_test)  # number of matches
+  J = length(unique(c(train_test$winner_id, train_test$loser_id)))  # number of players
+  covariates = c("age", "age^2", "N_months_since_last_match", "won_previous_set")
+  p = length(covariates)
+  X_skill = matrix(0, nrow = N_matches, ncol = 3*J)  # Matrix for the player skills
+  X1 = matrix(0, nrow = N_matches, ncol = p)  # Matrix for player 1 characteristics (age, age^2, and months since last match)
+  X2 = matrix(0, nrow = N_matches, ncol = p)  # Matrix for player 2 characteristics (age, age^2, and months since last match)
+  colnames(X1) = covariates
+  colnames(X2) = covariates
+
+  # Build X_skill, X1, and X2
+  id_players = unique(c(train_test$winner_id, train_test$loser_id))
+  colnames(X_skill) = c(paste0("overall_and_hard_skill_", id_players), paste0("clay_skill_", id_players), paste0("grass_skill_", id_players))
+  colnames(X1) = covariates
+  colnames(X2) = covariates
+  for (i in 1:N_matches) {
+    # Assign baseline (hard court) skills
+    X_skill[i, paste0("overall_and_hard_skill_", train_test$winner_id[i]) ] = 1
+    X_skill[i, paste0("overall_and_hard_skill_", train_test$loser_id[i])] = -1
+    # If surface is clay, assign clay skills
+    if (train_test[i, "surface"] == 2) {
+        X_skill[i, paste0("clay_skill_", train_test$winner_id[i])]  = 1
+        X_skill[i, paste0("clay_skill_", train_test$loser_id[i])]  = -1
+        # If surface is grass, assign grass skills
+    } else if (train_test[i, "surface"] == 3) {
+        X_skill[i, paste0("grass_skill_", train_test$winner_id[i]) ]  = 1
+        X_skill[i, paste0("grass_skill_", train_test$loser_id[i]) ]  = -1
+    }
+    # Build X1
+    X1[i, "age"] = train_test[i, "winner_age"][[1]]
+    X1[i, "age^2"] = train_test[i, "winner_age"][[1]]^2
+    X1[i, "N_months_since_last_match"] = log(train_test[i, "N_months_since_last_match_winner"][[1]] + 1)
+    X1[i, "won_previous_set"] = train_test[i, "p1_won_previous_set"][[1]]
+    # Build X2
+    X2[i, 1] = train_test[i, "loser_age"][[1]]
+    X2[i, 2] = train_test[i, "loser_age"][[1]]^2
+    X2[i, 3] = log(train_test[i, "N_months_since_last_match_loser"][[1]] + 1)
+    X2[i, 4] = train_test[i, "p2_won_previous_set"][[1]]
+  }
+  
+  # Separate into hard/clay/grass
+  hard_idx = train_test$surface == 1
+  clay_idx = train_test$surface == 2
+  grass_idx = train_test$surface == 3
+
+  # TRAIN design matrices
+  X_skill_hard = X_skill[hard_idx & train_idx, 1:J]
+  X_skill_clay = X_skill[clay_idx & train_idx, 1:(2*J)]
+  X_skill_grass = X_skill[grass_idx & train_idx, c(1:J, (2*J+1):(3*J))]
+
+  # TEST design matrices
+  X_skill_tilde = X_skill[test_idx, ]
+  X1_tilde = X1[test_idx, 3:4]
+  X2_tilde = X2[test_idx, 3:4]
+
+  # Prepare for TRAINING
+  #J = length(unique(c(train$winner_id, train$loser_id)))  # number of players in TRAINING
+  covariates = "N_months_since_last_match"
+  p = length(covariates)
+  
+  # Collect remaining data
+  winner_y_hard = train %>% filter(surface == 1) %>% pull(winner_y) 
+  winner_y_clay = train %>% filter(surface == 2) %>% pull(winner_y) 
+  winner_y_grass = train %>% filter(surface == 3) %>% pull(winner_y)  
+  total_n_hard = train %>% filter(surface == 1) %>% pull(N) 
+  total_n_clay = train %>% filter(surface == 2) %>% pull(N) 
+  total_n_grass = train %>% filter(surface == 3) %>% pull(N) 
+  
+  Nhard = nrow(X_skill_hard)  # number of matches on hard
+  Nclay = nrow(X_skill_clay)
+  Ngrass = nrow(X_skill_grass)
+  if (model_variable == "sets") {
+    N_tilde = test$best_of
+  } else {
+    N_tilde = 13 * test$best_of
+  }
+  
+  # Number of test matches
+  N_test = nrow(X_skill_tilde)
+  
+  ## EXTRA DECLARATIONS FOR YoY MODEL
+  # Time off matrices
+  # time_off_mat = cbind(X1[, 3], X2[, 3])
+  # time_off_mat_train_hard = time_off_mat[train_idx & hard_idx, ]
+  # time_off_mat_train_clay = time_off_mat[train_idx & clay_idx, ]
+  # time_off_mat_train_grass = time_off_mat[train_idx & grass_idx, ]
+  # time_off_mat_tilde = time_off_mat[test_idx, ]
+  # # Get number of matches on each surface for each year in the training set
+  # train$year = substr(train$tourney_date, 1, 4)
+  # years_train = unique(train$year)
+  # year_surface_df = train %>%
+  #   group_by(year, surface) %>%
+  #   summarize(n = n()) %>%
+  #   pivot_wider(., id_cols = c(year), names_from = c(surface), values_from = n)
+  # N_matches_each_surface_each_year = as.matrix(sapply(year_surface_df, as.numeric))[, 2:ncol(year_surface_df)]
+  # N_matches_each_surface_each_year[is.na(N_matches_each_surface_each_year)] = 0  # Fill NA with 0
+  # N years train
+  # N_years_train = length(years_train)
+  
+  # Fit model
+  print("ESTIMATING PARAMETERS")
+  fit = cmdstan_model(model_file_path, cpp_options = list(stan_threads = TRUE))
+  # model_data = list(J = J, N_hard = Nhard, N_clay = Nclay, N_grass = Ngrass, 
+  #                 p = p,
+  #                 N_test = nrow(X_skill_tilde), N_tilde = N_tilde,
+  #                 X_skill_tilde = X_skill_tilde, X1_tilde = X1_tilde[, 3], X2_tilde = X2_tilde[, 3],
+  #                 X_skill_hard = X_skill_hard, X_skill_clay = X_skill_clay, X_skill_grass = X_skill_grass,
+  #                 X1_hard = X1[hard_idx & train_idx, 3], X2_hard = X2[hard_idx & train_idx, 3], 
+  #                 X1_clay = X1[clay_idx & train_idx, 3], X2_clay = X2[clay_idx & train_idx, 3], 
+  #                 X1_grass = X1[grass_idx & train_idx, 3], X2_grass = X2[grass_idx & train_idx, 3],
+  #                 winner_y_hard = winner_y_hard, winner_y_clay = winner_y_clay, winner_y_grass = winner_y_grass,
+  #                 total_n_hard = total_n_hard, total_n_clay = total_n_clay, total_n_grass = total_n_grass, 
+  #                 grainsize = 1)
+  model_data = list(J = J, N_hard = Nhard, N_clay = Nclay, N_grass = Ngrass, 
+                  X_skill_hard = X_skill_hard, X_skill_clay = X_skill_clay, X_skill_grass = X_skill_grass, 
+                  X1_hard = X1[hard_idx & train_idx, 3:4], X2_hard = X2[hard_idx & train_idx, 3:4], 
+                  X1_clay = X1[clay_idx & train_idx, 3:4], X2_clay = X2[clay_idx & train_idx, 3:4], 
+                  X1_grass = X1[grass_idx & train_idx, 3:4], X2_grass = X2[grass_idx & train_idx, 3:4],
+                  winner_y_hard = winner_y_hard, winner_y_clay = winner_y_clay, winner_y_grass = winner_y_grass,
+                  total_n_hard = total_n_hard, total_n_clay = total_n_clay, total_n_grass = total_n_grass, 
+                  N_test = N_test, N_tilde = N_tilde, X_skill_tilde = X_skill_tilde, X1_tilde = X1_tilde, X2_tilde = X2_tilde,
+                  grainsize=1)
+  fit = fit$sample(model_data, chains = 4, parallel_chains = 4, threads_per_chain = 2, refresh = 200, iter_sampling=500, iter_warmup=500, init = function() list(alpha = runif(3*J, -1, 1), nu = runif(1, 0, 50))) 
+  train_time = fit$time()$total
+  # fit = fit$variational(model_data)  # VB
+  skill_draws = fit$draws()
+  
+  # Save diagnostics in case we want to check
+  skill_summaries = summarize_draws(bind_draws(skill_draws))
+  
+  # Collect draws
+  if (time_type == "static") {
+    idx_skills = grepl("alpha\\[.*\\]", skill_summaries$variable)
+    skills = skill_draws[, , idx_skills]
+    out2 = matrix(nrow = dim(skills)[1] * dim(skills)[2], ncol = dim(skills)[3])
+    # Extract draws
+    for (i in 1:(3*J)) {
+      out2[, i] = as.vector(rbind(skills[, , i]))
+    }
+    colnames(out2) = colnames(X_skill)
+    # Get posterior means of the skills
+    alpha_hard = colMeans(out2[, 1:J])
+    alpha_clay = colMeans(out2[, (J+1):(2*J)])
+    alpha_grass = colMeans(out2[, (2*J+1):(3*J)])
+  
+    # Organize posterior means with player IDs
+    overall_skills = data.frame(out2)
+    overall_skills["draw"] = 1:(dim(out2)[1])
+    overall_skills = pivot_longer(overall_skills, cols = -c("draw"))
+    overall_skills = overall_skills %>%
+      mutate(skill_type = str_extract(name, "(hard|clay|grass)"))
+
+    # Add column for player id
+    overall_skills = overall_skills %>%
+      mutate(player_id = str_extract(name, "[0-9]+"))
+
+    # Add clay and grass skills to baseline 
+    # Pivot for plotting
+    # Get player names
+    # overall_skills_by_surface = overall_skills %>%
+    #     group_by(player_id, draw) %>%
+    #     mutate(clay_skill = value[skill_type == "clay"] + value[skill_type == "hard"],
+    #         grass_skill = value[skill_type == "grass"] + value[skill_type == "hard"]) %>%
+    #     rename(hard_skill = value) %>%
+    #     select(-skill_type, -name) %>%
+    #     distinct(player_id, .keep_all = T) %>%
+    #     pivot_longer(., cols = c("hard_skill", "clay_skill", "grass_skill"), names_to = "skill_type") %>%
+    #     left_join(names, by = "player_id")
+    overall_skills_by_surface = overall_skills %>%
+      group_by(player_id, draw) %>%
+      mutate(clay_skill = value[skill_type == "clay"] + value[skill_type == "hard"],
+          grass_skill = value[skill_type == "grass"] + value[skill_type == "hard"],
+          hard_skill = value[skill_type == "hard"]) %>%  ## NEWLY ADDED like in year over year testing. confirm it works
+      #rename(hard_skill = value) %>%
+      select(-skill_type, -name, -value) %>%
+      #distinct(player_id, .keep_all = T) %>%
+      pivot_longer(., cols = c("hard_skill", "clay_skill", "grass_skill"), names_to = "skill_type") %>%
+      left_join(names, by = "player_id")
+  
+    posterior_mean_df = overall_skills_by_surface %>%
+        group_by(player_id, full_name, skill_type) %>%
+        summarize(posterior_mean = mean(value),
+                  posterior_sd = sd(value),
+                  lower.025_q = quantile(value, .025),
+                  upper.975_q = quantile(value, .975),
+                  posterior_median = median(value))
+  } else if (time_type == "yearly") {
+    idx_hard_skills = grepl("alpha\\[(\\d{2,}|[2-9]),.*,1\\]", skill_summaries$variable)  # Get all skills, EXCLUDING initial alpha
+    idx_clay_skills = grepl(paste0("alpha\\[(\\d{2,}|[2-9]),.*,2\\]"), skill_summaries$variable)
+    idx_grass_skills = grepl(paste0("alpha\\[(\\d{2,}|[2-9]),.*,3\\]"), skill_summaries$variable)
+    hard_skills = skill_draws[, , idx_hard_skills]
+    clay_skills = skill_draws[, , idx_clay_skills]
+    grass_skills = skill_draws[, , idx_grass_skills]
+    hard_out = matrix(nrow = dim(hard_skills)[1] * dim(hard_skills)[2], ncol = dim(hard_skills)[3])
+    clay_out = matrix(nrow = dim(clay_skills)[1] * dim(clay_skills)[2], ncol = dim(clay_skills)[3])
+    grass_out = matrix(nrow = dim(grass_skills)[1] * dim(grass_skills)[2], ncol = dim(grass_skills)[3])
+    # Extract draws
+    for (i in 1:ncol(hard_out)) {
+      hard_out[, i] = as.vector(rbind(hard_skills[, , i]))
+      clay_out[, i] = as.vector(rbind(clay_skills[, , i]))
+      grass_out[, i] = as.vector(rbind(grass_skills[, , i]))
+    }
+    colnames(hard_out) = paste(rep(colnames(X_skill_hard), each=length(years_train)), years_train, sep="_")
+    colnames(clay_out) = paste(rep(colnames(X_skill_clay)[(J+1):(2*J)], each=length(years_train)), years_train, sep="_")
+    colnames(grass_out) = paste(rep(colnames(X_skill_grass)[(J+1):(2*J)], each=length(years_train)), years_train, sep="_")
+    hard_out = as.data.frame(hard_out)
+    clay_out = as.data.frame(clay_out)
+    grass_out = as.data.frame(grass_out)
+    
+    overall_skills = cbind(hard_out, clay_out, grass_out)
+    overall_skills['draw'] = 1:nrow(overall_skills)
+    overall_skills = pivot_longer(overall_skills,cols = -c("draw"))
+    overall_skills = overall_skills %>%
+      mutate(skill_type = str_extract(name, "(hard|clay|grass)"),
+            year = str_extract(name, "[0-9]{4}$"),
+            player_id = str_extract(name, "[0-9]{6}"))
+    
+    overall_skills_by_surface = overall_skills %>%
+        group_by(player_id, year, draw) %>%
+        mutate(clay_skill = value[skill_type == "clay"] + value[skill_type == "hard"],
+              grass_skill = value[skill_type == "grass"] + value[skill_type == "hard"],
+              hard_skill = value[skill_type == "hard"]) %>%
+        select(-skill_type, -name, -value) %>%
+        #distinct(player_id, .keep_all = T) %>%
+        pivot_longer(., cols = c("hard_skill", "clay_skill", "grass_skill"), names_to = "skill_type") %>%
+        left_join(names, by = "player_id")
+    
+    posterior_mean_df = overall_skills_by_surface %>%
+      group_by(player_id, full_name, year, skill_type) %>%
+      summarize(posterior_mean = mean(value),
+                posterior_sd = sd(value),
+                lower.025_q = quantile(value, .025),
+                upper.975_q = quantile(value, .975),
+                posterior_median = median(value)) %>%
+      mutate(year = as.numeric(year))
+  }
+  
+  # Collect p1 win probabilities
+  probs_idx_1 = grepl("p1_tilde", skill_summaries$variable)
+  probs1_draws = skill_draws[, , probs_idx_1]
+  probs1 = matrix(nrow=dim(probs1_draws)[1] * dim(probs1_draws)[2], ncol = dim(probs1_draws)[3])
+  for (i in 1:(sum(probs_idx_1==T))) {
+    probs1[, i] = rbind(probs1_draws[, , i])
+  }
+  
+  if (model_variable == "sets") {
+    # Add SET win prob to test frame
+    p1_set_win_prob_post_means = colMeans(probs1)
+    test$pp_p1_set_win_prob = p1_set_win_prob_post_means
+    # Add MATCH win prob to test frame
+    best_of_vec = rep(test$best_of, each=nrow(probs1))
+    s_vec = as.vector(probs1)
+    match_win_probs = mapply(compute_match_win_prob_given_s, s_vec, best_of_vec)
+    match_win_prob_mat = matrix(match_win_probs, nrow=nrow(probs1), ncol = nrow(test), byrow = F)
+    match_win_prob_post_means = colMeans(match_win_prob_mat)
+    test$pp_p1_match_win_prob = match_win_prob_post_means
+  } else if (model_variable == "games") {
+    # Have to get the corresponding set win probabilities given the game win probabilities FIRST
+    p1_set_win_prob_post_means = colMeans(compute_set_win_prob_given_g(probs1))
+    test$pp_p1_set_win_prob = p1_set_win_prob_post_means
+    # Add MATCH win prob to test frame
+    g_vec = as.vector(probs1)
+    s_vec = compute_set_win_prob_given_g(g_vec)
+    best_of_vec = rep(test$best_of, each=nrow(probs1))
+    match_win_probs = mapply(compute_match_win_prob_given_s, s_vec, best_of_vec)
+    match_win_prob_mat = matrix(match_win_probs, nrow=nrow(probs1), ncol = nrow(test), byrow = F)
+    match_win_prob_post_means = colMeans(match_win_prob_mat)
+    test$pp_p1_match_win_prob = match_win_prob_post_means
+  }
+  
+  # Collect sets/games predictions
+  # preds_idx_1 = grepl("y_tilde_1", skill_summaries$variable)
+  # preds1_draws = skill_draws[, , preds_idx_1]
+  # preds1 = matrix(nrow=dim(preds1_draws)[1] * dim(preds1_draws)[2], ncol = dim(preds1_draws)[3])
+  # for (i in 1:(sum(preds_idx_1==T))) {
+  #   preds1[, i] = rbind(preds1_draws[, , i])
+  # }
+  # Take posterior predictive MEDIANS of the test matches
+  #p1_y_meds = apply(preds1, 2, median)
+  # Add to test frame
+  #test$pp_p1_y = p1_y_meds
+  
+  # Get GLICKO-2 ratings
+  glicko_train = train %>%
+  mutate(y = 1, tourney_date = as.numeric(tourney_date)) %>%
+  select(tourney_date, winner_id, loser_id, y)
+
+  glicko_out = glicko2(glicko_train)  # defaults
+
+  glicko_ratings = glicko_out[[1]] %>%
+    mutate(Player = as.character(Player)) %>%
+    inner_join(names %>% select(player_id, full_name), by = c("Player" = "player_id"))
+
+  # Make glicko predictions on the test set
+  glicko_test = test %>%
+    mutate(tourney_date = as.numeric(tourney_date)) %>%
+    select(tourney_date, winner_id, loser_id)
+
+  # Get Glicko-2 predictions
+  # If player has played less than tng matches (15 by default), set their rating to 2200, deviation of 300 (default) and predict. 
+  # gamma=0 means no player 1 advantage
+  glicko_predict = predict(glicko_out, glicko_test, tng=15,trat=c(2200, 300), gamma=0)
+  glicko_test$p1_win_prob = glicko_predict
+  glicko_acc = mean(glicko_predict > 0.5)
+  
+  # Get model & ranking accuracies
+  model_acc = mean(test$pp_p1_match_win_prob > 0.5) 
+  ranking_acc = mean(ifelse(is.na(test$winner_rank), 0, ifelse(is.na(test$loser_rank), 1, ifelse(test$winner_rank < test$loser_rank, 1, 0))))
+  
+  res = list(#skill_draws=skill_draws, 
+             skill_summaries=skill_summaries, overall_skills_by_surface=overall_skills_by_surface, pp_p1_win_prob_draws = probs1, 
+             #pp_y_draws = preds1, 
+             posterior_mean_df=posterior_mean_df, test=test, model_acc = model_acc, ranking_acc = ranking_acc,
+             glicko_ratings = glicko_ratings, glicko_test=glicko_test, glicko_acc = glicko_acc, train_time = train_time)
+  return(res)
+}
+```
+
+```{r}
+tmp = train_bayesian_bt("../stan/bernoulli_set_by_set.stan", test_month = "2010-02-01", max_rank = Inf, winner_y = "y", N = "best_of", time_type = "static", model_variable = "sets")
+
+tmp$skill_summaries %>% filter(grepl("beta", variable))
+```
+
+
+```{r}
+# WE TEST YEARS 2010-2017
+months = sort(unique(atp_match_dat$month))
+
+# Take the first month of 2010 as the first test month
+first_test_month = atp_match_dat %>%
+  filter(tourney_date >= '2010-01-01') %>%
+  pull(month) %>%
+  min()
+
+test_months = months[months >= first_test_month]
+
+max_rank = Inf
+
+# Containers
+acc_list = list("multi_t_bernoulli_sets_acc" = c(),
+                "ranking" = c(), "glicko" = c())
+
+# Raw draws
+#multi_norm_games_skill_draws = list()
+#multi_norm_sets_skill_draws = list()
+#multi_norm_negbin_sets_skill_draws = list()
+#multi_t_games_skill_draws = list()
+#multi_t_sets_skill_draws = list()
+#multi_t_negbin_sets_skill_draws = list()
+
+# Parameter summaries
+#multi_t_sets_skill_summaries = list()
+#multi_t_games_skill_summaries = list()
+multi_t_bernoulli_sets_skill_summaries = list()
+#multi_norm_sets_skill_summaries = list()
+#multi_norm_games_skill_summaries = list()
+#multi_norm_negbin_sets_skill_summaries = list()
+
+# Posterior mean DFs
+#multi_t_sets_post_means_dfs = list()
+#multi_t_games_post_mean_dfs = list()
+multi_t_bernoulli_sets_post_mean_dfs = list()
+#multi_norm_sets_post_means_dfs = list()
+#multi_norm_games_post_mean_dfs = list()
+#multi_norm_negbin_sets_post_mean_dfs = list()
+
+# Test DFs
+#multi_t_sets_test_frames = list()
+#multi_t_games_test_frames = list()
+multi_t_bernoulli_sets_test_frames = list()
+#multi_norm_sets_test_frames = list()
+#multi_norm_games_test_frames = list()
+#multi_norm_negbin_sets_test_frames = list()
+
+# Train times
+#multi_t_sets_train_times = list()
+#multi_t_games_train_times = list()
+multi_t_bernoulli_sets_train_times = list()
+#multi_norm_sets_train_times = list()
+#multi_norm_games_train_times = list()
+#multi_norm_negbin_sets_train_times = list()
+
+# Glicko ratings
+glicko_ratings = list()
+
+# CHANGED 1 TO 61 FOR MEMORY ISSUES
+for (i in 1:length(test_months)) {  
+  test_month_i = test_months[i]
+  
+  # CHECK IF THERE ARE TEST MATCHES OR NOT
+  # players_to_rate = rankings %>%
+  #   filter(ranking_date < test_month_i, rank <= max_rank) %>%
+  #   pull(player) %>%
+  #   unique()
+
+  test = atp_match_dat %>%
+    filter(month == test_month_i)
+
+  if (check_for_test_matches(test) == "next") {next}
+  # GO TO NEXT ITERATION IF THERE ARE NONE
+  
+  print(paste("TRAINING WINDOW: 2 YEARS BEFORE THE TEST MONTH:", test_month_i))
+  
+  #print("Training Multi-T Sets Model")
+  #multi_t_sets_train_out = train_bayesian_bt("../stan/correlated_skills_multi_t.stan", test_month_i, max_rank, "sets_won_winner", "total_sets", "static", "sets")
+  
+  #print("Training New NegBin Multi-Normal Sets Model")
+  #multi_norm_negbin_sets_train_out = train_bayesian_bt("../stan/new_model.stan", test_month_i, max_rank, "sets_won_loser", "best_of", "static", "games")
+  
+  print("Training New Bernoulli Multi-T Sets Model")
+  multi_t_bernoulli_sets_train_out = train_bayesian_bt("../stan/bernoulli_set_by_set.stan", test_month_i, max_rank, "y", "best_of", "static", "sets")
+
+  #print("Training Multi-T Games Model")
+  #multi_t_games_train_out = train_bayesian_bt("../stan/correlated_skills_multi_t.stan", test_month_i, max_rank, "w_games", "games", "static", "games")
+  
+  #print("Training Multi-Normal Sets Model")
+  #multi_norm_sets_train_out = train_bayesian_bt("../stan/correlated_skills.stan", test_month_i, max_rank, "sets_won_winner", "total_sets", "static", "sets")
+  
+  #print("Training Multi-Normal Games Model")
+  #multi_norm_games_train_out = train_bayesian_bt("../stan/correlated_skills.stan", test_month_i, max_rank, "w_games", "games", "static", "games")
+  
+  #print("Training Multi-Normal NegBin Sets Model")
+  #multi_norm_negbin_sets_train_out = train_bayesian_bt("../stan/correlated_skills_negbin.stan", test_month_i, max_rank, "sets_won_loser", "best_of", "static", "sets")
+  
+  #print("Training Multi-T NegBin Sets Model")
+  #multi_t_negbin_sets_train_out = train_bayesian_bt("../stan/correlated_skills_negbin_multi_t.stan", test_month_i, max_rank, "sets_won_loser", "best_of", "static", "sets")
+  
+  # Collect skill draws
+  #multi_norm_games_skill_draws[[i]] = multi_norm_games_train_out$skill_draws
+  #multi_norm_sets_skill_draws[[i]] = multi_norm_sets_train_out$skill_draws
+  #multi_norm_negbin_sets_skill_draws[[i]] = multi_norm_negbin_sets_train_out$skill_draws
+  #multi_t_games_skill_draws[[i]] = multi_t_games_train_out$skill_draws
+  #multi_t_sets_skill_draws[[i]] = multi_t_sets_train_out$skill_draws
+  #multi_t_negbin_sets_skill_draws[[i]] = multi_t_negbin_sets_train_out$skill_draws
+  
+  # Collect skill summaries
+  #multi_t_sets_skill_summaries[[i]] = multi_t_sets_train_out$skill_summaries
+  #multi_t_games_skill_summaries[[i]] = multi_t_games_train_out$skill_summaries
+  #multi_norm_sets_skill_summaries[[i]] = multi_norm_sets_train_out$skill_summaries
+  #multi_norm_games_skill_summaries[[i]] = multi_norm_games_train_out$skill_summaries
+  #multi_norm_negbin_sets_skill_summaries[[i]] = multi_norm_negbin_sets_train_out$skill_summaries
+  multi_t_bernoulli_sets_skill_summaries[[i]] = multi_t_bernoulli_sets_train_out$skill_summaries
+
+  # Collect train posterior mean DFs
+  #multi_t_sets_post_means_dfs[[i]] = multi_t_sets_train_out$posterior_mean_df
+  #multi_t_games_post_mean_dfs[[i]] = multi_t_games_train_out$posterior_mean_df
+  #multi_norm_sets_post_means_dfs[[i]] = multi_norm_sets_train_out$posterior_mean_df
+  #multi_norm_games_post_mean_dfs[[i]] = multi_norm_games_train_out$posterior_mean_df
+  #multi_norm_negbin_sets_post_mean_dfs[[i]] = multi_norm_negbin_sets_train_out$posterior_mean_df
+  multi_t_bernoulli_sets_post_mean_dfs[[i]] = multi_t_bernoulli_sets_train_out$posterior_mean_df
+  
+  # Collect predictions held in the test frame
+  #multi_t_sets_test_frames[[i]] = multi_t_sets_train_out$test
+  #multi_t_games_test_frames[[i]] = multi_t_games_train_out$test
+  #multi_norm_sets_test_frames[[i]] = multi_norm_sets_train_out$test
+  #multi_norm_games_test_frames[[i]] = multi_norm_games_train_out$test
+  #multi_norm_negbin_sets_test_frames[[i]] = multi_norm_negbin_sets_train_out$test
+  multi_t_bernoulli_sets_test_frames[[i]] = multi_t_bernoulli_sets_train_out$test
+  
+  # Collect accuracies
+  #acc_list$multi_t_sets_acc = c(acc_list$multi_t_sets_acc, multi_t_sets_train_out$model_acc)
+  #acc_list$multi_t_games_acc = c(acc_list$multi_t_games_acc, multi_t_games_train_out$model_acc)
+  #acc_list$multi_norm_sets_acc = c(acc_list$multi_norm_sets_acc, multi_norm_sets_train_out$model_acc)
+  #acc_list$multi_norm_games_acc = c(acc_list$multi_norm_games_acc, multi_norm_games_train_out$model_acc)
+  #acc_list$multi_norm_negbin_sets_acc = c(acc_list$multi_norm_negbin_sets_acc, multi_norm_negbin_sets_train_out$model_acc)
+  acc_list$multi_t_bernoulli_sets_acc = c(acc_list$multi_t_bernoulli_sets_acc, multi_t_bernoulli_sets_train_out$model_acc)
+  acc_list$ranking= c(acc_list$ranking, multi_t_bernoulli_sets_train_out$ranking_acc)
+  
+  # Collect train times
+  #multi_t_sets_train_times[[i]] = multi_t_sets_train_out$train_time
+  #multi_t_games_train_times[[i]] = multi_t_games_train_out$train_time
+  #multi_norm_sets_train_times[[i]] = multi_norm_sets_train_out$train_time
+  #multi_norm_games_train_times[[i]] = multi_norm_games_train_out$train_time
+  #multi_norm_negbin_sets_train_times[[i]] = multi_norm_negbin_sets_train_out$train_time
+  multi_t_bernoulli_sets_train_times[[i]] = multi_t_bernoulli_sets_train_out$train_time
+  
+  #print(paste("Multi-T Sets accuracy:", multi_t_sets_train_out$model_acc))
+  #print(paste("Multi-T Games accuracy:", multi_t_games_train_out$model_acc))
+  #print(paste("Multi-Norm Sets accuracy:", multi_norm_sets_train_out$model_acc))
+  #print(paste("Multi-Norm Games accuracy:", multi_norm_games_train_out$model_acc))
+  #print(paste("Multi-Norm NegBin Sets accuracy:", multi_norm_negbin_sets_train_out$model_acc))
+  print(paste("Multi-T Bernoulli Sets accuracy:", multi_t_bernoulli_sets_train_out$model_acc))
+  print(paste("Ranking accuracy:", multi_t_bernoulli_sets_train_out$ranking_acc))
+}
+```
+
+```{r}
+saveRDS(multi_t_bernoulli_sets_post_mean_dfs, "./multi_t_models3/bernoulli_sets_post_mean_dfs.RData")
+saveRDS(multi_t_bernoulli_sets_test_frames, "./multi_t_models3/bernoulli_sets_test_frames.RData")
+saveRDS(multi_t_bernoulli_sets_skill_summaries, "./multi_t_models3/bernoulli_sets_skill_summaries.RData")
+saveRDS(multi_t_bernoulli_sets_train_times, "./multi_t_models3/bernoulli_sets_train_times.RData")
+write.csv(acc_list$multi_t_bernoulli_sets_acc, "./multi_t_models3/bernoulli_sets_test_acc.csv")
+```
+
+
