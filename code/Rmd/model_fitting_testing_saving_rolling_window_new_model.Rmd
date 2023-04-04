@@ -471,14 +471,10 @@ train_bayesian_bt = function(model_file_path, test_month, max_rank, winner_y, N,
 
 ```{r}
 # WE TEST YEARS 2010-2017
-months = sort(unique(complete_atp_match_dat$month))
+months = sort(unique(atp_match_dat$month))
 
 # Take the first month of 2010 as the first test month
-first_test_month = complete_atp_match_dat %>%
-  filter(tourney_date >= '2010-01-01') %>%
-  pull(month) %>%
-  min()
-
+first_test_month = '2010-01-01'
 test_months = months[months >= first_test_month]
 
 max_rank = Inf
@@ -532,19 +528,19 @@ multi_t_negbin_sets_train_times = list()
 # Glicko ratings
 glicko_ratings = list()
 
-# CHANGED 1 TO 61 FOR MEMORY ISSUES
 for (i in 1:length(test_months)) {  
   test_month_i = test_months[i]
   
-  # CHECK IF THERE ARE TEST MATCHES OR NOT
+  
   # players_to_rate = rankings %>%
   #   filter(ranking_date < test_month_i, rank <= max_rank) %>%
   #   pull(player) %>%
   #   unique()
-
+  
   test = complete_atp_match_dat %>%
     filter(month == test_month_i)
-
+  
+  # CHECK IF THERE ARE TEST MATCHES OR NOT
   if (check_for_test_matches(test) == "next") {next}
   # GO TO NEXT ITERATION IF THERE ARE NONE
   

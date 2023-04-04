@@ -19,6 +19,7 @@ functions {
      + choose(10, 5) .* g^5 .* (1-g)^5 .* choose(2, 1) .* g .* (1-g) .* g;  // win 7-6
      return s;
   }
+<<<<<<< HEAD
   // Computes the log-PDF of the negative binomial distribution with y failures until r successes with success probability p
   real negbin_lpdf(real[] y, vector p, vector r) {
     return sum(lchoose(to_vector(y) + r - 1, to_vector(y)) + r.*log(p) + to_vector(y).*log1m(p));

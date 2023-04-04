@@ -69,23 +69,13 @@ multi_t_games_test_out = readRDS("../../saved_model_results/multi_t_models2/mult
          p1_won_previous_set = NA,
          p2_won_previous_set = NA) %>%
   select(-best_of)
+
 multi_t_bernoulli_sets_test_out = do.call(rbind, readRDS("../../saved_model_results/multi_t_models3/bernoulli_sets_test_frames.RData")) %>%
   rename(winner_y = y) %>%
   mutate(model = "Multi-T_bernoulli_sets",
          n = NA,
          pp_p1_y = NA) %>%
   select(-best_of)
-# missing1_multi_t_negbin_sets_test_out = readRDS("./multi_t_models2/multi_t_negbin_sets_test_frames.RData") %>%
-#   rename(winner_y = sets_won_loser, n = best_of) %>%
-#   mutate(model = "Multi-T_negbin_sets",
-#          p1_won_previous_set = NA,
-#          p2_won_previous_set = NA)
-# 
-# missing2_multi_t_negbin_sets_test_out = do.call(rbind, readRDS("./multi_t_models2/rerun_multi_t_negbin_sets_test_frames.RData")) %>%
-#   rename(winner_y = sets_won_loser, n = best_of) %>%
-#   mutate(model = "Multi-T_negbin_sets",
-#          p1_won_previous_set = NA,
-#          p2_won_previous_set = NA)
 
 multi_t_negbin_sets_test_out = do.call(rbind, readRDS("../../saved_model_results/multi_t_added_bin_coeff_and_fixed_inv_logit/multi_t_negbin_sets_test_frames.RData")) %>%
   rename(winner_y = sets_won_loser, n = best_of) %>%
@@ -93,11 +83,11 @@ multi_t_negbin_sets_test_out = do.call(rbind, readRDS("../../saved_model_results
          p1_won_previous_set = NA,
          p2_won_previous_set = NA)
 
-# multi_t_negbin_sets_test_out = missing1_multi_t_negbin_sets_test_out %>%
-#   left_join(missing2_multi_t_negbin_sets_test_out, by = join_by(winner_id, loser_id, n, score, set_order, winner_y, winner_age, loser_age, N_months_since_last_match_winner, N_months_since_last_match_loser, surface, tourney_date, month, winner_rank, loser_rank, model, p1_won_previous_set, p2_won_previous_set)) %>%
-#   mutate(pp_p1_set_win_prob = coalesce(pp_p1_set_win_prob.x, pp_p1_set_win_prob.y),
-#          pp_p1_match_win_prob = coalesce(pp_p1_match_win_prob.x, pp_p1_match_win_prob.y)) %>%
-#   select(-ends_with(".x"), -ends_with(".y"))
+multi_t_negbin_sets_test_out = missing1_multi_t_negbin_sets_test_out %>%
+  left_join(missing2_multi_t_negbin_sets_test_out, by = join_by(winner_id, loser_id, n, score, set_order, winner_y, winner_age, loser_age, N_months_since_last_match_winner, N_months_since_last_match_loser, surface, tourney_date, month, winner_rank, loser_rank, model, p1_won_previous_set, p2_won_previous_set)) %>%
+  mutate(pp_p1_set_win_prob = coalesce(pp_p1_set_win_prob.x, pp_p1_set_win_prob.y),
+         pp_p1_match_win_prob = coalesce(pp_p1_match_win_prob.x, pp_p1_match_win_prob.y)) %>%
+  select(-ends_with(".x"), -ends_with(".y"))
 
 # Multi-Norm models
 # multi_norm_games_test_out = do.call(rbind, readRDS("./multi_normal_models/multi_normal_games_test_frames.RData")) %>%
@@ -122,7 +112,7 @@ multi_t_games_post_mean_dfs = readRDS("../../saved_model_results/multi_t_models2
 multi_t_games_post_mean_dfs = multi_t_games_post_mean_dfs[lengths(multi_t_games_post_mean_dfs) != 0]
 multi_t_bernoulli_sets_post_mean_dfs = readRDS("../../saved_model_results/multi_t_models3/bernoulli_sets_post_mean_dfs.RData")
 multi_t_negbin_sets_post_mean_dfs = readRDS("../../saved_model_results/multi_t_added_bin_coeff_and_fixed_inv_logit/multi_t_negbin_sets_post_mean_dfs.RData")
-multi_t_negbin_sets_post_mean_dfs = multi_t_negbin_sets_post_mean_dfs[lengths(multi_t_negbin_sets_post_mean_dfs) != 0]
+
 # Multi-Norm
 # multi_norm_games_post_mean_dfs = readRDS("./multi_normal_models/multi_normal_games_post_mean_dfs.RData")
 # multi_norm_sets_post_mean_dfs = readRDS("./multi_normal_models/multi_normal_sets_post_mean_dfs.RData")
