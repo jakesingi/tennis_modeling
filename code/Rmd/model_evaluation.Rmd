@@ -1,0 +1,1189 @@
+---
+title: "Betting Testing"
+author: "Jake Singleton"
+date: "2023-01-11"
+output: html_document
+---
+
+```{r, message=F, warning=F}
+library(tidyverse)
+```
+
+
+We have 6 Bayesian Bradley-Terry models, Glicko-2, and a "null" ranking model for a total of 8 models to compare.
+
+First we load the relevant tennis match data:
+
+```{r}
+# Get match, player names, and rankings data
+atp_match_dat = read.csv('../../data/complete_match_info_fixed_n_months.csv', header = T, 
+                         colClasses = c("character", "character", "factor", "character", "integer", "character",  "Date", "double", "double", "integer", "integer", "integer", "integer", "integer", "integer", "integer", rep("integer", 3))) %>%
+  mutate(surface = case_when(surface == "Hard" ~ 1,
+                           surface == "Clay" ~ 2,
+                           surface == "Grass" ~ 3,
+                           surface == "Carpet" ~ 1)) 
+
+# Subset 2009 - 2017 seasons
+atp_match_dat = atp_match_dat %>%
+  filter(tourney_date >= '2009-01-01' & tourney_date <= '2017-12-31') %>%
+  mutate(week = as.numeric(tourney_date),
+         month = as.Date(paste0(strftime(tourney_date,"%Y-%m"), "-01")))
+
+months = sort(unique(atp_match_dat$month))
+
+# Take the first month of 2010 as the first test month
+first_test_month = atp_match_dat %>%
+  filter(tourney_date >= '2010-01-01') %>%
+  pull(month) %>%
+  min()
+
+test_months = months[months >= first_test_month]
+```
+
+Next we load player ranking and biographical information:
+
+```{r}
+# Get rankings
+rankings00s = read.csv("../../data/atp_rankings_00s.csv", header = T, colClasses = c("character", "double", "character", "double")) %>%
+  mutate(ranking_date = as.Date(ranking_date, format="%Y%m%d"))
+rankings10s = read.csv('../../data/atp_rankings_10s.csv', header = T, colClasses = c("character", "double", "character", "double")) %>%
+  mutate(ranking_date = as.Date(ranking_date, format="%Y%m%d"))
+rankings20s = read.csv('../../data/atp_rankings_20s.csv', header = T, colClasses = c("character", "double", "character", "double")) %>%
+  mutate(ranking_date = as.Date(ranking_date, format="%Y%m%d"))
+rankings = rbind(rankings00s, rankings10s, rankings20s)
+rm(rankings00s, rankings10s, rankings20s)
+
+# Get player bios
+names = read.csv("../../data/atp_players.csv", header = T) %>%
+  mutate(full_name = paste(name_first, name_last)) %>%
+  mutate(player_id = as.character(player_id))
+```
+
+Now let's load the test results from the 2 Bayesian BT models.
+
+```{r}
+# Multi-T models
+multi_t_games_test_out = readRDS("../../saved_model_results/multi_t_models2/multi_t_games_test_frames.RData") %>%
+  rename(winner_y = w_games, n = games) %>%
+  mutate(model = "Multi-T_bin_games",
+         p1_won_previous_set = NA,
+         p2_won_previous_set = NA) %>%
+  select(-best_of)
+multi_t_bernoulli_sets_test_out = do.call(rbind, readRDS("../../saved_model_results/multi_t_models3/bernoulli_sets_test_frames.RData")) %>%
+  rename(winner_y = y) %>%
+  mutate(model = "Multi-T_bernoulli_sets",
+         n = NA,
+         pp_p1_y = NA) %>%
+  select(-best_of)
+# missing1_multi_t_negbin_sets_test_out = readRDS("./multi_t_models2/multi_t_negbin_sets_test_frames.RData") %>%
+#   rename(winner_y = sets_won_loser, n = best_of) %>%
+#   mutate(model = "Multi-T_negbin_sets",
+#          p1_won_previous_set = NA,
+#          p2_won_previous_set = NA)
+# 
+# missing2_multi_t_negbin_sets_test_out = do.call(rbind, readRDS("./multi_t_models2/rerun_multi_t_negbin_sets_test_frames.RData")) %>%
+#   rename(winner_y = sets_won_loser, n = best_of) %>%
+#   mutate(model = "Multi-T_negbin_sets",
+#          p1_won_previous_set = NA,
+#          p2_won_previous_set = NA)
+
+multi_t_negbin_sets_test_out = do.call(rbind, readRDS("../../saved_model_results/multi_t_added_bin_coeff_and_fixed_inv_logit/multi_t_negbin_sets_test_frames.RData")) %>%
+  rename(winner_y = sets_won_loser, n = best_of) %>%
+  mutate(model = "Multi-T_negbin_sets",
+         p1_won_previous_set = NA,
+         p2_won_previous_set = NA)
+
+# multi_t_negbin_sets_test_out = missing1_multi_t_negbin_sets_test_out %>%
+#   left_join(missing2_multi_t_negbin_sets_test_out, by = join_by(winner_id, loser_id, n, score, set_order, winner_y, winner_age, loser_age, N_months_since_last_match_winner, N_months_since_last_match_loser, surface, tourney_date, month, winner_rank, loser_rank, model, p1_won_previous_set, p2_won_previous_set)) %>%
+#   mutate(pp_p1_set_win_prob = coalesce(pp_p1_set_win_prob.x, pp_p1_set_win_prob.y),
+#          pp_p1_match_win_prob = coalesce(pp_p1_match_win_prob.x, pp_p1_match_win_prob.y)) %>%
+#   select(-ends_with(".x"), -ends_with(".y"))
+
+# Multi-Norm models
+# multi_norm_games_test_out = do.call(rbind, readRDS("./multi_normal_models/multi_normal_games_test_frames.RData")) %>%
+#   rename(winner_y = w_games, n = games) %>%
+#   mutate(model = "Multi-Norm_bin_games") %>%
+#   select(-best_of)
+# multi_norm_sets_test_out = do.call(rbind, readRDS("./multi_normal_models/multi_normal_sets_test_frames.RData")) %>%
+#   rename(winner_y = sets_won_winner, n = total_sets) %>%
+#   mutate(model = "Multi-Norm_bin_sets") %>%
+#   select(-best_of)
+# multi_norm_negbin_sets_test_out = do.call(rbind, readRDS("./multi_normal_models/multi_normal_negbin_sets_test_frames.RData")) %>%
+#   rename(winner_y = sets_won_loser, n = best_of) %>%
+#   mutate(model = "Multi-Norm_negbin_sets")
+```
+
+First let's add the month to the posterior mean data frames. We will add these values to the test data frames for inspection.
+
+```{r}
+# LOAD POSTERIOR MEAN DFs
+# Multi-T
+multi_t_games_post_mean_dfs = readRDS("../../saved_model_results/multi_t_models2/multi_t_games_post_mean_dfs.RData")
+multi_t_games_post_mean_dfs = multi_t_games_post_mean_dfs[lengths(multi_t_games_post_mean_dfs) != 0]
+multi_t_bernoulli_sets_post_mean_dfs = readRDS("../../saved_model_results/multi_t_models3/bernoulli_sets_post_mean_dfs.RData")
+multi_t_negbin_sets_post_mean_dfs = readRDS("../../saved_model_results/multi_t_added_bin_coeff_and_fixed_inv_logit/multi_t_negbin_sets_post_mean_dfs.RData")
+multi_t_negbin_sets_post_mean_dfs = multi_t_negbin_sets_post_mean_dfs[lengths(multi_t_negbin_sets_post_mean_dfs) != 0]
+# Multi-Norm
+# multi_norm_games_post_mean_dfs = readRDS("./multi_normal_models/multi_normal_games_post_mean_dfs.RData")
+# multi_norm_sets_post_mean_dfs = readRDS("./multi_normal_models/multi_normal_sets_post_mean_dfs.RData")
+# multi_norm_negbin_sets_post_mean_dfs = readRDS("./multi_normal_models/multi_normal_negbin_sets_post_mean_dfs.RData")
+
+# First let's add the month to the posterior mean dfs
+for (i in 1:length(test_months)) {
+  # multi_norm_games_post_mean_dfs[[i]]$month = test_months[i]
+  # multi_norm_games_post_mean_dfs[[i]]$model = "Multi-Norm_bin_games"
+  # multi_norm_sets_post_mean_dfs[[i]]$month = test_months[i]
+  # multi_norm_sets_post_mean_dfs[[i]]$model = "Multi-Norm_bin_sets"
+  # multi_norm_negbin_sets_post_mean_dfs[[i]]$month = test_months[i]
+  # multi_norm_negbin_sets_post_mean_dfs[[i]]$model = "Multi-Norm_negbin_sets"
+  multi_t_games_post_mean_dfs[[i]]$month = test_months[i]
+  multi_t_games_post_mean_dfs[[i]]$model = "Multi-T_bin_games"
+  multi_t_bernoulli_sets_post_mean_dfs[[i]]$month = test_months[i]
+  multi_t_bernoulli_sets_post_mean_dfs[[i]]$model = "Multi-T_bernoulli_sets"
+  multi_t_negbin_sets_post_mean_dfs[[i]]$month = test_months[i]
+  multi_t_negbin_sets_post_mean_dfs[[i]]$model = "Multi-T_negbin_sets"
+}
+
+
+multi_t_games_post_mean_dfs = do.call(rbind, multi_t_games_post_mean_dfs)
+multi_t_bernoulli_sets_post_mean_dfs = do.call(rbind, multi_t_bernoulli_sets_post_mean_dfs)
+multi_t_negbin_sets_post_mean_dfs = do.call(rbind, multi_t_negbin_sets_post_mean_dfs)
+#multi_norm_games_post_mean_dfs = do.call(rbind, multi_norm_games_post_mean_dfs)
+#multi_norm_sets_post_mean_dfs = do.call(rbind, multi_norm_sets_post_mean_dfs)
+#multi_norm_negbin_sets_post_mean_dfs = do.call(rbind, multi_norm_negbin_sets_post_mean_dfs)
+
+# Now we bind them together so we can join them with the test matches
+posterior_mean_frames = rbind(multi_t_games_post_mean_dfs, multi_t_negbin_sets_post_mean_dfs, multi_t_bernoulli_sets_post_mean_dfs)
+  #rbind(multi_t_games_post_mean_dfs, multi_t_sets_post_mean_dfs, multi_norm_games_post_mean_dfs, multi_norm_sets_post_mean_dfs,
+                                         #multi_norm_negbin_sets_post_mean_dfs, multi_t_negbin_sets_post_mean_dfs)
+wide_posterior_mean_frames = pivot_wider(posterior_mean_frames,
+            id_cols = c(player_id, full_name, month, model),
+            names_from = skill_type,
+            values_from = c(starts_with("posterior"), ends_with("_q")))
+head(wide_posterior_mean_frames)
+```
+
+And we can also see how "vanilla" (aka default) Glicko-2 does, where we first train on the whole 2009 season, and then get month-by-month predictions for years 2010-2017, updating the ratings after each month, just as we did for the Bayesian BT models.
+
+```{r}
+library(PlayerRatings)
+
+months = sort(unique(atp_match_dat$month))
+
+# Take the first month of 2010 as the first test month
+first_test_month = atp_match_dat %>%
+  filter(tourney_date >= '2010-01-01') %>%
+  pull(month) %>%
+  min()
+
+test_months = months[months >= first_test_month]
+
+max_rank = Inf
+
+# Containers
+glicko_accs = rep(0, length(test_months))
+glicko_ratings_list = list()
+glicko_test_frames = list()
+
+for (i in 1:length(test_months)) {  
+  test_month_i = test_months[i]
+  
+  # players_to_rate = rankings %>%
+  #   filter(ranking_date < test_month_i, rank <= max_rank) %>%
+  #   pull(player) %>%
+  #   unique()
+  
+  # Subset train/test
+  glicko_train = atp_match_dat %>%
+    filter(tourney_date < test_month_i) %>% # winner_id %in% players_to_rate, loser_id %in% players_to_rate) %>%
+    mutate(y = 1, month = as.numeric(month))
+
+  glicko_test = atp_match_dat %>%
+    filter(month == test_month_i) %>% #, winner_id %in% players_to_rate, loser_id %in% players_to_rate) %>%
+    mutate(winner_y = 1, n = 1, month = as.numeric(month))
+  
+  # Train the model
+  glicko_out = glicko2(glicko_train %>% select(month, winner_id, loser_id, y))  # defaults
+  
+  # Clean up and obtain Glicko-2 ratings
+  glicko_ratings = glicko_out[[1]] %>%
+    mutate(Player = as.character(Player)) %>%
+    inner_join(names %>% select(player_id, full_name), by = c("Player" = "player_id"))
+  
+  # Make Glicko-2 predictions
+  # If player has played less than tng matches (15 by default), set their rating to 2200, deviation of 300 (default) and predict. 
+  # gamma=0 means no player 1 advantage
+  glicko_predict = predict(glicko_out, glicko_test %>% select(month, winner_id, loser_id), 
+                           tng=15, trat=c(2200, 300), gamma=0)
+  glicko_test$p1_win_prob = glicko_predict
+  glicko_test$model = "Glicko-2"
+  glicko_test$pp_p1_set_win_prob = NA
+  glicko_test$pp_p1_y = NA
+  
+  # Compute & store Glicko-2 test accuracy
+  glicko_acc = mean(glicko_predict > 0.5)
+  glicko_accs[i] = glicko_acc 
+  
+  # Store Glicko-2 ratings
+  glicko_ratings_list[[i]] = glicko_ratings
+  
+  # Store Glicko-2 predictions
+  glicko_test_frames[[i]] = glicko_test
+}
+
+glicko_test_out = do.call(rbind, glicko_test_frames)
+
+# Join it with, say, multi_t_games_test_out so the columns match
+glicko_test_out = glicko_test_out %>%
+  inner_join(multi_t_games_test_out %>% select(winner_id, loser_id, tourney_date),
+             by = c("winner_id", "loser_id", "tourney_date")) %>%
+  rename(pp_p1_match_win_prob = p1_win_prob) %>%
+  select(ends_with("_id"), score, set_order, winner_y, n, ends_with("_age"), contains("months"), surface, tourney_date, month, ends_with("_rank"), 
+         pp_p1_set_win_prob, pp_p1_match_win_prob, pp_p1_y, model) %>%
+  mutate(winner_y = NA, n = NA, pp_p1_set_win_prob = NA, pp_p1_y = NA, month = as.Date(month, origin=.Date(0)), 
+         p1_won_previous_set = NA,
+         p2_won_previous_set = NA)
+```
+
+
+```{r}
+# Bind them together
+
+multi_t_negbin_sets_test_out$pp_p1_y = NA # Since did not sample with new model
+
+test_out = rbind(multi_t_games_test_out, multi_t_negbin_sets_test_out,  multi_t_bernoulli_sets_test_out, glicko_test_out) %>%
+                 #multi_t_sets_test_out, 
+                 #multi_norm_games_test_out, multi_norm_sets_test_out, multi_norm_negbin_sets_test_out,
+                 #) %>%
+  distinct(., winner_id, loser_id, tourney_date, score, model, .keep_all = T) %>%  # Eliminates one duplicated Stepanek-Troicki match from 2012-05-21. Not sure how this happened
+  mutate(year = substr(tourney_date, 1, 4))
+table(test_out$model)
+```
+
+It's curious there are fewer matches in the Bernoulli sets model... hmmm.
+
+```{r}
+test_out %>%
+  group_by(model) %>%
+  summarize(mising_win_probs = sum(is.na(pp_p1_match_win_prob)))
+```
+
+Good! None of the models has missing match win probabilities.
+
+```{r}
+all(test_out %>%
+  group_by(winner_id, loser_id, tourney_date, score) %>%
+  summarize(n=n()) %>%
+  arrange(desc(n)) %>%
+  pull(n) <= 4)
+
+test_out %>%
+  group_by(winner_id, loser_id, tourney_date, score) %>%
+  summarize(n=n()) %>%
+  arrange(n)
+```
+
+We don't have Bernoulli sets model predictions for matches where a player retired. Let's remove these.
+
+```{r}
+test_out = test_out %>%
+  filter(!grepl(" RET", score, fixed = T), !grepl(" DEF", score, fixed = T))
+```
+
+
+```{r}
+all(test_out %>%
+  group_by(winner_id, loser_id, tourney_date, score) %>%
+  summarize(n=n()) %>%
+  arrange(n) %>%
+  pull(n) == 4)
+```
+
+```{r}
+table(test_out$model)
+```
+
+
+This is great--we have 22,654 test matches, and we have predictions for each of these matches for each of the 3 Bayesian BT models as well as vanilla Glicko-2.
+
+We now need to load betting data for the test years, 2010-2017.
+
+```{r}
+# Get odds data
+cols = c("Tournament", "Date", "Series", "Court", "Surface", "Round", "best_of", "Winner", "Loser", "W1", "L1", "W2","L2", "W3", "L3", "W4", "L4", "W5", "L5", "Wsets", "Lsets", "Comment", "MaxW", "MaxL", "AvgW", "AvgL")
+odds = rbind(read.csv("../../data/tennis_odds_2010.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2011.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2012.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2013.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2014.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2015.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2016.csv", header = T) %>% select(all_of(cols)),
+             read.csv("../../data/tennis_odds_2017.csv", header = T) %>% select(all_of(cols))) %>%
+  filter(Comment == "Completed") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%y"),
+         surface = case_when(Surface == "Hard" ~ 1,
+                             Surface == "Clay" ~ 2,
+                             Surface == "Grass" ~ 3),
+         score = case_when(best_of == 3 & (Wsets == 2 & Lsets == 0) ~ paste(paste(W1, L1, sep="-"), paste(W2, L2, sep="-")),
+                           best_of == 3 & (Wsets == 2 & Lsets == 1) ~ paste(paste(paste(W1, L1, sep="-"), paste(W2, L2, sep="-")), paste(W3, L3, sep="-")),
+                           best_of == 5 & (Wsets == 3 & Lsets == 0) ~ paste(paste(paste(W1, L1, sep="-"), paste(W2, L2, sep="-")), paste(W3, L3, sep="-")),
+                           best_of == 5 & (Wsets == 3 & Lsets == 1) ~ paste(paste(paste(paste(W1, L1, sep="-"), paste(W2, L2, sep="-")), paste(W3, L3, sep="-")), paste(W4, L4, sep="-")),
+                           best_of == 5 & (Wsets == 3 & Lsets == 2) ~ paste(paste(paste(paste(paste(W1, L1, sep="-"), paste(W2, L2, sep="-")), paste(W3, L3, sep="-")), paste(W4, L4, sep="-")), paste(W5, L5, sep="-")))) %>%
+  filter(!is.na(score))
+
+head(odds)
+```
+
+Great. Now we define some deterministic prediction functions and a betting function.
+
+```{r}
+# Gets set win probability given game win probability
+compute_set_win_prob_given_g = function(game_win_prob) {
+  set_win_prob = game_win_prob^6*(1 + 
+                                    6*(1-game_win_prob) + 
+                                    21*(1-game_win_prob)^2 + 
+                                    56*(1-game_win_prob)^3 + 
+                                    126*(1-game_win_prob)^4 + 
+                                    252*game_win_prob*(1-game_win_prob)^5 + 
+                                    504*(1-game_win_prob)^6*game_win_prob)
+  return(set_win_prob)
+}
+
+# Computes match win probability given set win probability and best of (3 or 5)
+compute_match_win_prob_given_s = function(set_win_prob, best_of) {
+  if (best_of == 3) {
+    match_win_prob = set_win_prob^2 + 2 * set_win_prob^2 * (1-set_win_prob) 
+  } else {  # best of 5
+    match_win_prob = set_win_prob^3*(1 + 3*(1-set_win_prob) + 6*(1-set_win_prob)^2)
+  }
+  return(match_win_prob)
+}
+
+# Computes expected payouts from betting on player 1 and player 2 given respective odds and probabilities
+compute_expected_payout = function(o1, o2, p1, p2) {
+  # Expected payout betting one unit on p1
+  E1 = (o1 - 1)*p1 - 1*p2
+  # Expected payout betting one unit on p2
+  E2 = (o2 - 1)*p2 - 1*p1
+  return(list(E1, E2))
+}
+
+# Betting function returning profit from betting. If we don't bet, returns 0
+bet_profit = function(E_payout_bet_on_winner, E_payout_bet_on_loser, threshold, odds_w, odds_l) {
+  best_payout = max(E_payout_bet_on_winner, E_payout_bet_on_loser)
+  if ((E_payout_bet_on_winner == best_payout) & (E_payout_bet_on_winner >= threshold)) {
+    return(odds_w - 1)
+  } else if ((E_payout_bet_on_loser == best_payout) & (E_payout_bet_on_loser >= threshold)) {
+    return(-1)
+  } else {
+    return(0)
+  }
+}
+```
+
+And some string manipulation functions:
+
+```{r}
+# Function takes a name and index and returns last name
+get_last_name = function(name, idx) {
+  return(str_split(name, " ")[[1]][idx])
+}
+```
+
+We can make some plots of the win probability distributions:
+
+```{r}
+ggplot(test_out, aes(model, pp_p1_match_win_prob)) +
+  geom_boxplot() +
+  ggtitle("Distribution of Winner Probs by Model") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+
+ggplot(test_out, aes(pp_p1_match_win_prob)) +
+  geom_histogram() +
+  facet_wrap(~model) +
+  ggtitle("Distribution of Winner Probs by Model")
+```
+
+Now we can join the bound-together test data with the odds data:
+
+```{r}
+# Get player names
+test_out = test_out %>%
+  left_join(names %>% dplyr::select(player_id, full_name), by=c('winner_id' = 'player_id')) %>%
+  left_join(names %>% dplyr::select(player_id, full_name), by=c('loser_id' = 'player_id'), suffix=c("_winner", "_loser"))
+# Do some string manipulation
+test_out$winner_last = sapply(test_out$full_name_winner, get_last_name, 2)
+test_out$loser_last = sapply(test_out$full_name_loser, get_last_name, 2)
+odds$winner_last = sapply(odds$Winner, get_last_name, 1)
+odds$loser_last = sapply(odds$Loser, get_last_name, 1)
+test_out$score2 = str_replace_all(test_out$score, "\\(\\d+\\)", "")
+
+# Join test data with odds data
+test_out_odds = test_out %>%
+  inner_join(odds %>% select(winner_last, loser_last, surface, score, Date, MaxW, MaxL, AvgW, AvgL), 
+             by = c("winner_last", "loser_last", "surface", "score2" = "score")) %>%
+  filter(abs(tourney_date - Date) <= 14) %>%
+  distinct(winner_id, loser_id, Date, model, .keep_all = T) %>%
+  select(-c(Date, winner_last, loser_last)) %>%
+  drop_na(MaxW, MaxL, AvgW, AvgL) %>%
+  filter(MaxL < 1000)  # data quality issue
+table(test_out_odds$model)
+
+n_months = length(unique(test_out_odds$month))
+```
+
+
+```{r}
+# Check for duplicates
+# Repeated Matches with winner / loser:
+# 104571 / 103843
+# 104926 / 103163
+# are okay since they played twice within 2 weeks on the same surface and had the same score!
+# Otherwise a match should be duplicated no more than 4 times since we are comparing 4 models for each match.
+
+dupes = test_out_odds %>%
+  group_by(winner_id, loser_id, score, tourney_date) %>%
+  summarize(num_dupe = n())
+
+dupes %>%
+  arrange(desc(num_dupe))
+```
+
+So now with odds data we're down to 16,873 test matches, so we've lost some matches with missing odds or questionably high payouts, but that's okay, we still have plenty.
+
+Let's just run a check that the join worked correctly--we will check that the matches in `test_out_odds` are all in `test_out`--and we know this latter data frame is correct.
+
+```{r}
+# Check matches in test_out_odds are in test_out
+all(do.call(paste0, test_out_odds[, c("winner_id", "loser_id", "surface", "tourney_date")]) %in% do.call(paste0, test_out[, c("winner_id", "loser_id", "surface", "tourney_date")]) == T)
+```
+
+Nice!
+
+Now for the fun part-- we can start collecting Brier scores:
+
+```{r}
+brier_list = list("model" = rep(0, length(unique(test_out_odds$model)) + 2),
+                  "brier_score" = rep(0, length(unique(test_out_odds$model)) + 2))  # Add 2 for the odds later
+# Compute Brier scores for models
+for (i in 1:length(unique(test_out_odds$model))) {
+  model_name = unique(test_out_odds$model)[i]
+  brier = mean((test_out_odds %>% filter(model == model_name) %>% pull(pp_p1_match_win_prob) - 1)^2)
+  brier_list$model[i] = model_name
+  brier_list$brier_score[i] = brier
+}
+
+# Compute Brier score for betting odds
+one_set_test = test_out_odds %>%
+  filter(model == "Multi-T_bin_games") %>%
+  mutate(winner_implied_prob_best_odds = (1/MaxW) / (1/MaxW + 1/MaxL),
+         winner_implied_prob_avg_odds = (1/AvgW)/ (1/AvgW + 1/AvgL))
+brier_best = mean((one_set_test$winner_implied_prob_best_odds - 1)^2)
+brier_avg = mean((one_set_test$winner_implied_prob_avg_odds - 1)^2)
+brier_list$model[length(unique(test_out_odds$model)) + 1] = "Best_odds"
+brier_list$model[length(unique(test_out_odds$model)) + 2] = "Avg_odds"
+brier_list$brier_score[length(unique(test_out_odds$model)) + 1] = brier_best
+brier_list$brier_score[length(unique(test_out_odds$model)) + 2] = brier_avg
+
+brier_df = as.data.frame(brier_list)
+brier_df %>%
+  arrange(desc(brier_score))
+```
+
+The Brier scores for the games model is the best and is closely followed by the Bernoulli sets model. But they don't beat the betting lines.
+
+Now we can find the expected payouts using our models' probabilities.
+
+```{r}
+test_out_odds$best_winner_exp_payout = 0 
+test_out_odds$best_loser_exp_payout = 0
+test_out_odds$avg_winner_exp_payout = 0 
+test_out_odds$avg_loser_exp_payout = 0
+for (i in 1:nrow(test_out_odds)) {
+  best_exp_payouts_i = compute_expected_payout(test_out_odds$MaxW[i], test_out_odds$MaxL[i], test_out_odds$pp_p1_match_win_prob[i], 1-test_out_odds$pp_p1_match_win_prob[i])
+  test_out_odds$best_winner_exp_payout[i] = best_exp_payouts_i[[1]]
+  test_out_odds$best_loser_exp_payout[i] = best_exp_payouts_i[[2]]
+  avg_exp_payouts_i = compute_expected_payout(test_out_odds$AvgW[i], test_out_odds$AvgL[i], test_out_odds$pp_p1_match_win_prob[i], 1-test_out_odds$pp_p1_match_win_prob[i])
+  test_out_odds$avg_winner_exp_payout[i] = avg_exp_payouts_i[[1]]
+  test_out_odds$avg_loser_exp_payout[i] = avg_exp_payouts_i[[2]]
+}
+
+head(test_out_odds %>% arrange(desc(best_winner_exp_payout)))
+```
+
+```{r}
+# Get max expected payout
+test_out_odds$max_exp_payout = apply(test_out_odds[, c("best_winner_exp_payout", "best_loser_exp_payout")], 1, max)
+test_out_odds$avg_exp_payout = apply(test_out_odds[, c("avg_winner_exp_payout", "avg_loser_exp_payout")], 1, max)
+```
+
+We have the maximum expected payouts given by the best odds and average odds for each model. Now we can try betting on matches when the expected payout given by the model is larger than some threshold. The thresholds I will try are \{0, 0.01, 0.02, ..., 2.54, 2.55, ..., 5.98, 5.99, 6\}.
+
+```{r, message=F}
+# Try a bunch of other thresholds
+t = seq(0, 6, by = 0.01)
+best_odds_profits = list()
+avg_odds_profits = list()
+best_odds_bets_placed = list()
+avg_odds_bets_placed = list()
+years = list()
+for (i in 1:length(t)) {
+  test_out_odds$best_odds_profit = mapply(bet_profit, test_out_odds$best_winner_exp_payout, test_out_odds$best_loser_exp_payout, t[i], test_out_odds$MaxW, test_out_odds$MaxL)
+  test_out_odds$avg_odds_profit = mapply(bet_profit, test_out_odds$avg_winner_exp_payout, test_out_odds$avg_loser_exp_payout, t[i], test_out_odds$AvgW, test_out_odds$AvgL)
+  grp = test_out_odds %>%
+    group_by(model, year) %>%
+    summarize(best_odds_net_profit = sum(best_odds_profit), best_odds_n_bets = sum(best_odds_profit != 0), best_odds_return = best_odds_net_profit / best_odds_n_bets,
+            avg_odds_net_profit = sum(avg_odds_profit), avg_odds_n_bets = sum(avg_odds_profit != 0), avg_odds_return = avg_odds_net_profit / avg_odds_n_bets)
+  best_odds_profits[[i]] = grp$best_odds_net_profit
+  names(best_odds_profits[[i]]) = grp$model
+  avg_odds_profits[[i]] = grp$avg_odds_net_profit
+  names(avg_odds_profits[[i]]) = grp$model
+  best_odds_bets_placed[[i]] = grp$best_odds_n_bets
+  names(best_odds_bets_placed[[i]]) = grp$model
+  avg_odds_bets_placed[[i]] = grp$avg_odds_n_bets
+  names(avg_odds_bets_placed[[i]]) = grp$model
+  years[[i]] = grp$year
+  names(years[[i]]) = grp$model
+}
+```
+
+```{r}
+# Clean up results and put them into a "profit" data frame
+n_models = length(unique(test_out_odds$model))
+n_test_years = length(unique(test_out_odds$year))
+profit_df = data.frame(best_odds_profit = unlist(best_odds_profits), best_odds_bets_placed = unlist(best_odds_bets_placed), 
+                       avg_odds_profit = unlist(avg_odds_profits), avg_odds_bets_placed = unlist(avg_odds_bets_placed),
+                       model = names(unlist(best_odds_profits)), thresh = rep(t, each=n_models*n_test_years), year=unlist(years))
+profit_df %>%
+  slice(20:30)
+```
+
+We can also compute a "null" model to use as a benchmark. Let's let the null model be the model that always bets on the higher-ranked player to win.
+
+```{r}
+# Just take one set of test matches (don't want to overcount)
+# Replace NA ranks with Inf
+one_set_test_matches = test_out_odds %>%
+  filter(model == "Multi-T_bin_games") %>%
+  mutate(winner_rank = ifelse(is.na(winner_rank), Inf, winner_rank),
+         loser_rank = ifelse(is.na(loser_rank), Inf, loser_rank))
+
+null_model_results = one_set_test_matches %>%
+  mutate(best_odds_profit = case_when(winner_rank < loser_rank ~ MaxW - 1,
+                                 loser_rank < winner_rank ~ -1,
+                                 TRUE ~ 0),
+         avg_odds_profit = case_when(winner_rank < loser_rank ~ AvgW - 1,
+                                 loser_rank < winner_rank ~ -1,
+                                 TRUE ~ 0),
+         model = 'null')
+
+null_model_results_by_year = null_model_results %>%
+  group_by(year) %>%
+  summarize(best_odds_bets_placed = sum(best_odds_profit != 0),
+            avg_odds_bets_placed = sum(avg_odds_profit != 0),
+            best_odds_profit = sum(best_odds_profit),
+            avg_odds_profit = sum(avg_odds_profit),
+            model = 'null')
+null_model_results_by_year$thresh = seq(0, 6, length=n_test_years)
+
+sum(null_model_results$best_odds_profit)
+sum(null_model_results$avg_odds_profit)
+```
+
+We can also plot the profit of each model by year.
+
+```{r, fig.width=10}
+model.labs = c("1.(a)", "1.(b)", "1.(c)", "Glicko-2", "null")
+names(model.labs) = c("Multi-T_bin_games", "Multi-T_bernoulli_sets", "Multi-T_negbin_sets", "Glicko-2", "null")
+# PLOT year over year profits
+ggplot(profit_df %>% filter(model %in% c("Glicko-2", "Multi-Norm_bin_games", "Multi-T_bin_games")), aes(thresh, best_odds_profit, color=year)) + 
+  geom_line() +
+  labs(x="Betting threshold (E)", y="Profit (units)", title="Betting with best odds available") +
+  geom_hline(data=null_model_results_by_year, aes(yintercept=best_odds_profit, color=year)) +
+  facet_wrap(~model, nrow=2, labeller = labeller(model = model.labs)) +
+  ylim(-150, 150)
+#ggsave("../manuscript/first_draft/images/year_over_year_profits_best_odds.png")
+
+ggplot(profit_df %>% filter(model %in% c("Glicko-2", "Multi-Norm_bin_games", "Multi-T_bin_games")), aes(thresh, avg_odds_profit, color=year)) + 
+  geom_line() +
+  labs(x="Betting threshold (E)", y="Profit (units)", title="Betting with average odds available") + 
+  geom_hline(data=null_model_results_by_year, aes(yintercept=avg_odds_profit, color=year)) +
+  facet_wrap(~model, nrow=2, labeller = labeller(model = model.labs)) +
+  ylim(-150, 25)
+#ggsave("../manuscript/first_draft/images/year_over_year_profits_average_odds.png")
+```
+
+```{r}
+# Compute AUCs
+library(DescTools)
+
+auc_mat = matrix(nrow = length(unique(profit_df$model)), ncol = length(unique(profit_df$year)))
+models = unique(profit_df$model)
+years = unique(profit_df$year)
+
+
+for (i in 1:length(models)) {
+  for (j in 1:length(years)) {
+    filtered_profit_df = profit_df %>% filter(model == models[i], year == years[j])
+    auc_mat[i, j] = AUC(filtered_profit_df$thresh, filtered_profit_df$best_odds_profit)
+  }
+}
+
+auc_df = as.data.frame(t(auc_mat))
+auc_df$year = years
+colnames(auc_df) = c(models, "year")
+auc_df
+```
+
+```{r}
+# Summary statistics
+summary(auc_df %>% select(-year)) 
+```
+
+```{r}
+# Get null model areas
+null_model_results_by_year$AUC = 6*null_model_results_by_year$best_odds_profit
+summary(null_model_results_by_year$AUC)
+```
+
+
+And get cumulative profits by summing over the years.
+
+```{r}
+# Now get cumulative profit by summing over the years
+
+# For the models
+cum_profit_df = profit_df %>% 
+  group_by(model, thresh) %>% 
+  summarize(best_odds_profit = sum(best_odds_profit),
+            avg_odds_profit = sum(avg_odds_profit),
+            best_odds_bets_placed = sum(best_odds_bets_placed),
+            avg_odds_bets_placed = sum(avg_odds_bets_placed))
+
+# For the null model
+cum_null_model_results = null_model_results_by_year %>%
+  group_by(model) %>%
+  summarize(best_odds_profit = sum(best_odds_profit),
+            avg_odds_profit = sum(avg_odds_profit),
+            best_odds_bets_placed = sum(best_odds_bets_placed),
+            avg_odds_bets_placed = sum(avg_odds_bets_placed))
+
+cum_profit_df %>%
+  arrange(desc(best_odds_profit)) %>%
+  head(20)
+```
+
+We plot the cumulative profits now.
+
+```{r, fig.width=5, fig.height=3}
+library(scales)
+colors = hue_pal()(8)
+# PLOT cumulative profits
+ggplot(cum_profit_df, aes(thresh, best_odds_profit, color=model)) + 
+  geom_line() +
+  labs(x="Betting threshold (E)", y="Profit (units)", title="Betting with best odds available") +
+  geom_hline(data=cum_null_model_results, aes(yintercept=best_odds_profit, color=model)) +
+  scale_color_manual(labels = model.labs, values = colors)
+#ggsave("../manuscript/first_draft/images/cumulative_profits_best_odds.png")
+
+ggplot(cum_profit_df, aes(thresh, avg_odds_profit, color=model)) + 
+  geom_line() +
+  labs(x="Betting threshold (E)", y="Profit (units)", title="Betting with average odds available") +
+  geom_hline(data=cum_null_model_results, aes(yintercept=avg_odds_profit, color=model)) +
+  scale_color_manual(labels = model.labs, values = colors)
+#ggsave("../manuscript/first_draft/images/cumulative_profits_average_odds.png")
+```
+
+Note, however, in a true betting model we must pick the threshold in advance. So, in the style of McHale & Morton (2010), we can pick the threshold for the betting strategy iteratively. Since we have forecasts for 2010-2012, first we can find the best threshold for these months, use this threshold to make bets on 2013, then use 2011-2013's best threshold to make bets on 2014, etc, until 2017.
+
+Let's implement this:
+
+```{r, message=F}
+# Find best threshold in given year vector for each model
+find_best_thresh_by_year_for_each_model = function(given_years, odds_type) {
+  if (odds_type == "best") {
+    best_thresh_by_model = profit_df %>%
+      filter(year %in% as.character(given_years)) %>%
+      group_by(model, thresh) %>%
+      summarize(best_profit = sum(best_odds_profit)) %>% # Does sum(best_odds_profit) for odds_type = 'best'
+      arrange(desc(best_profit)) %>%
+      summarize(thresh = first(thresh)) %>%
+      arrange(model)
+  } else {
+    best_thresh_by_model = profit_df %>%
+      filter(year %in% as.character(given_years)) %>%
+      group_by(model, thresh) %>%
+      summarize(best_profit = sum(avg_odds_profit)) %>% # Does sum(avg_odds_profit) for odds_type = '[anything else]'
+      arrange(desc(best_profit)) %>%
+      summarize(thresh = first(thresh)) %>%
+      arrange(model)
+  }
+  return(best_thresh_by_model)
+  # COULD DO A (WEIGHTED) AVERAGE OF PRIOR YEARS PROFITS, E.G.
+  # best_thresh_by_year_by_model = profit_df %>%
+  #   #filter(year %in% c(as.character(as.numeric(given_year)),  as.character(as.numeric(given_year) - 1))) %>%
+  #   filter(year <= given_year) %>%
+  #   group_by(model, year) %>%
+  #   arrange(desc(best_odds_profit)) %>%
+  #   summarize(thresh = first(thresh), profit = first(best_odds_profit)) %>%
+  #   ungroup(year) %>%
+  #   mutate(avg_thresh = mean(thresh)) %>%
+  #   group_by(model) %>%
+  #   summarize(thresh = round(first(avg_thresh), 2))
+  #return(best_thresh_by_year_by_model)
+}
+
+find_best_thresh_by_year_for_each_model(2010:2012, "best")
+find_best_thresh_by_year_for_each_model(2010:2012, "avg")
+```
+
+
+```{r, message=F}
+# Runs betting experiment
+run_betting_experiment = function(test_years, odds_type) {
+  res_profit = list()
+  res_matches_we_bet_on = list()
+
+  best_thresh_df = find_best_thresh_by_year_for_each_model(2010:2012, odds_type)
+  best_threshes = best_thresh_df %>% pull(thresh)
+  model_names = best_thresh_df %>% pull(model)
+
+  for (i in 1:length(test_years)) {
+    # Get the profit for each model in year test_year using the best thresh from previous year
+    lst_profit = list()
+    lst_matches_we_bet_on = list()
+    for (j in 1:length(best_threshes)) {
+      # Record profits from matches we bet on
+      lst_profit[[j]] = profit_df %>% filter(model == model_names[j], 
+                                    year == as.character(test_years[i]),
+                                    thresh > best_threshes[j] - .005,
+                                    thresh < best_threshes[j] + .005)
+      # Record matches with our bets
+      matches_we_bet_on = test_out_odds %>% 
+        filter(model == model_names[j],
+             year == as.character(test_years[i]),
+             max_exp_payout >= (best_threshes[j])) %>%
+             mutate(profit = ifelse(odds_type == "best", ifelse(max_exp_payout == best_winner_exp_payout, MaxW-1, -1),
+                                    ifelse(max_exp_payout == avg_winner_exp_payout, AvgW-1, -1))) %>%#,
+                    #avg_odds_profit = ifelse(max_exp_payout == avg_winner_exp_payout, AvgW-1, -1)) %>%
+          inner_join(wide_posterior_mean_frames, by = c("winner_id" = "player_id", "month", "model")) %>%
+          inner_join(wide_posterior_mean_frames, by = c("loser_id" = "player_id", "month", "model"), suffix = c("_winner", "_loser"))
+                  
+      lst_matches_we_bet_on[[j]] = matches_we_bet_on
+    }
+    if (odds_type == "best") {
+      res_profit[[i]] = do.call(rbind, lst_profit) %>%
+        select(contains("best"), model, thresh, year)
+    } else {
+      res_profit[[i]] = do.call(rbind, lst_profit) %>%
+        select(contains("avg"), model, thresh, year)
+    }
+    res_matches_we_bet_on[[i]] = do.call(rbind, lst_matches_we_bet_on)
+  
+    # Update threshes, use as big a rolling window as possible
+    best_threshes = find_best_thresh_by_year_for_each_model((2010):(test_years[i]), odds_type) %>% pull(thresh)
+  }
+  profit_res = do.call(rbind, res_profit) %>%
+    arrange(model)
+  out = list(betting_results = profit_res,
+             matches_with_bets = do.call(rbind, res_matches_we_bet_on))
+  return(out)
+}
+```
+
+```{r}
+# Now run the betting experiment 
+# For given odds_type
+odds_type = "best"
+# And for given test_years
+test_years = seq(2013, 2017, by = 1)
+
+out_best_odds = run_betting_experiment(test_years, odds_type)
+out_best_odds_betting_results = out_best_odds$betting_results
+
+out_best_odds_betting_results
+```
+
+```{r}
+# Sum over the years to get cumulative profit, bets placed, avg thresh, etc
+out_best_odds_betting_results %>%
+  group_by(model) %>%
+  summarize(total_profit = sum(best_odds_profit),
+            total_bets_placed = sum(best_odds_bets_placed),
+            average_thresh_used = mean(thresh),
+            n_test_years = n()) %>%
+  arrange(desc(total_profit))
+```
+
+The games model is clearly best.
+
+```{r}
+# Now run the betting experiment 
+# For given odds_type
+odds_type = "avg"
+# And for given test_years
+test_years = seq(2013, 2017, by = 1)
+
+out_avg_odds = run_betting_experiment(test_years, odds_type)
+out_avg_odds_betting_results = out_avg_odds$betting_results
+
+out_avg_odds_betting_results
+```
+
+```{r}
+# Sum over the years to get cumulative profit, bets placed, avg thresh, etc
+out_avg_odds_betting_results %>%
+  group_by(model) %>%
+  summarize(total_profit = sum(avg_odds_profit),
+            total_bets_placed = sum(avg_odds_bets_placed),
+            average_thresh_used = mean(thresh),
+            n_test_years = n()) %>%
+  arrange(desc(total_profit))
+```
+
+```{r}
+# See matches we bet on for the Multi-T games model
+matches_res = out_best_odds$matches_with_bets
+multi_t_games_model_bets = matches_res %>% 
+  filter(model == "Multi-T_bin_games") %>%
+  arrange(desc(best_odds_profit))
+
+multi_t_bernoulli_sets_bets = matches_res %>%
+  filter(model == "Multi-T_bernoulli_sets")
+
+multi_t_negbin_sets_model_bets = matches_res %>% 
+  filter(model == "Multi-T_negbin_sets") %>%
+  arrange(desc(best_odds_profit))
+
+head(multi_t_games_model_bets)
+head(multi_t_negbin_sets_model_bets)
+```
+
+```{r}
+quantile(multi_t_games_model_bets$MaxW)
+hist(multi_t_games_model_bets$MaxW, breaks = 100)
+
+edges = c(multi_t_games_model_bets %>% filter(best_odds_profit > 0) %>% pull(MaxW))
+```
+
+
+```{r}
+# Check performance by surface
+multi_t_games_model_bets %>%
+  group_by(surface) %>%
+  summarize(profit = sum(best_odds_profit), n_bets_won = sum(best_odds_profit > 0), n_bets_placed = n())
+
+multi_t_bernoulli_sets_bets %>%
+  group_by(surface) %>%
+  summarize(profit = sum(best_odds_profit), n_bets_won = sum(best_odds_profit > 0), n_bets_placed = n())
+
+multi_t_negbin_sets_model_bets %>%
+  group_by(surface) %>%
+  summarize(profit = sum(best_odds_profit), n_bets_won = sum(best_odds_profit > 0), n_bets_placed = n())
+```
+
+```{r}
+multi_t_games_model_bets %>%
+  filter(best_odds_profit > 0) %>%
+  arrange(desc(best_odds_profit)) %>%
+  head(20)
+
+multi_t_bernoulli_sets_bets %>%
+  filter(best_odds_profit > 0) %>%
+  arrange(desc(best_odds_profit)) %>%
+  head(20)
+
+multi_t_negbin_sets_model_bets %>%
+  filter(best_odds_profit > 0) %>%
+  arrange(desc(best_odds_profit)) %>%
+  head(20)
+```
+
+We can also plot player skills over time:
+
+```{r}
+players_to_plot = c("Novak Djokovic", "Roger Federer", "Rafael Nadal", "Andy Murray", "Juan Martin del Potro", "David Ferrer", "Tomas Berdych", "Jo-Wilfried Tsonga", "Stan Wawrinka",
+                    "Marin Cilic")
+
+ggplot(posterior_mean_frames %>% filter(skill_type == 'hard_skill', model == "Multi-T_bin_games", full_name %in% players_to_plot), 
+       aes(month, posterior_mean, color=full_name)) +
+  geom_line(linewidth=1.0) +
+  #geom_line(aes(month, lower.025_q, color=full_name), linetype='dashed') +
+  #geom_line(aes(month, upper.975_q, color=full_name), linetype = 'dashed')  +
+  ggtitle("Hard Court Skills") +
+  labs(y = 'posterior mean', color = "name")
+#ggsave("../manuscript/first_draft/images/hard_skills_over_time.png")  
+
+ggplot(posterior_mean_frames %>% filter(skill_type == 'clay_skill', model == "Multi-T_bin_games", full_name %in% players_to_plot), 
+       aes(month, posterior_mean, color=full_name)) +
+  geom_line(linewidth=1.0)  +
+  #geom_line(aes(month, lower.025_q, color=full_name), linetype='dashed') +
+  #geom_line(aes(month, upper.975_q, color=full_name), linetype = 'dashed')  +
+  ggtitle("Clay Court Skills") +
+  labs(y = 'posterior mean', color = "name")
+#ggsave("../manuscript/first_draft/images/clay_skills_over_time.png")  
+
+ggplot(posterior_mean_frames %>% filter(skill_type == 'grass_skill', model == "Multi-T_bin_games", full_name %in% players_to_plot), 
+       aes(month, posterior_mean, color=full_name)) +
+  geom_line(linewidth=1.0)  +
+  #geom_line(aes(month, lower.025_q, color=full_name), linetype='dashed') +
+  #geom_line(aes(month, upper.975_q, color=full_name), linetype = 'dashed')  +
+  ggtitle("Grass Court Skills") +
+  labs(y = 'posterior mean', color = "name")
+#ggsave("../manuscript/first_draft/images/grass_skills_over_time.png")  
+```
+
+```{r}
+ggplot(posterior_mean_frames %>% filter(full_name == "Rafael Nadal", model == "Multi-T_negbin_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Roger Federer") +
+  labs(y = "solid: posterior mean; dotted: 95% credible interval", color = "surface") +
+  scale_color_manual(labels = c("clay", "grass", "hard"), values = c("red", "forestgreen", "blue"))
+#ggsave("../manuscript/first_draft/images/federer_combo_1a.png")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Roger Federer", model == "Multi-T_negbin_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  labs(y = "solid: posterior mean; dotted: 95% credible interval", color = "surface") +
+  scale_color_manual(labels = c("clay", "grass", "hard"), values = c("red", "forestgreen", "blue")) +
+  ggtitle("Roger Federer")
+#ggsave("../manuscript/first_draft/images/federer_combo_1b.png")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Roger Federer", model == "Multi-T_bernoulli_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Roger Federer") +
+  labs(y = "solid: posterior mean; dotted: 95% credible interval", color = "surface") +
+  scale_color_manual(labels = c("clay", "grass", "hard"), values = c("red", "forestgreen", "blue"))
+#ggsave("../manuscript/first_draft/images/federer_combo_2a.png")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Roger Federer", model == "Multi-T_bin_games"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Roger Federer: Multi-T bernoulli sets")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Rafael Nadal", model == "Multi-T_bernoulli_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Rafa Nadal: Multi-T bernoulli sets")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Rafael Nadal", model == "Multi-T_bin_games"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Andy Roddick: Multi-T negbin games")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Tommy Haas", model == "Multi-T_negbin_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("del Potro: Multi-T negbin games")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Novak Djokovic", model == "Multi-T_negbin_sets"), 
+       aes(x=month, y=posterior_mean, color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  geom_line(aes(month, lower.025_q), linetype='dashed') +
+  geom_line(aes(month, upper.975_q), linetype = 'dashed') +
+  ggtitle("Djokovic: Multi-T negbin games")
+```
+
+```{r}
+# See how width of 95% interval changes
+ggplot(posterior_mean_frames %>% filter(full_name == "Andy Roddick", model == "Multi-T_bin_games"), 
+       aes(x=month, y=(upper.975_q - lower.025_q), color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  ggtitle("Andy Roddick: Length of 95% Posterior Interval")
+
+ggplot(posterior_mean_frames %>% filter(full_name == "Rafael Nadal", model == "Multi-T_bin_games"), 
+       aes(x=month, y=(upper.975_q - lower.025_q), color=skill_type)) +
+  geom_line(linewidth=1.0) +
+  ggtitle("Rafael Nadal: Length of 95% Posterior Interval")
+```
+
+We can also acquire and plot accuracies.
+
+```{r}
+# Acquire accuracies
+multi_t_bin_games_accs = rbind(read.csv("../../saved_model_results/multi_t_models2/first22_multi_t_games_test_acc.csv"),
+                               read.csv("../../saved_model_results/multi_t_models2/next38_multi_t_games_test_acc.csv"),
+                               read.csv("../../saved_model_results/multi_t_models2/last32_multi_t_games_test_acc.csv"))
+multi_t_bernoulli_sets_accs = read.csv("../../saved_model_results/multi_t_models3/bernoulli_sets_test_acc.csv")
+multi_t_negbin_sets_accs = read.csv("../../saved_model_results/multi_t_added_bin_coeff_and_fixed_inv_logit/multi_t_negbin_sets_test_accs.csv")
+
+# multi_norm_bin_games_accs = read.csv("./multi_normal_models/multi_normal_games_test_acc.csv")
+# multi_norm_bin_sets_accs = read.csv("./multi_normal_models/multi_normal_sets_test_acc.csv")
+# multi_norm_negbin_sets_accs = read.csv("./multi_normal_models/multi_normal_negbin_sets_test_acc.csv")
+
+acc_df = data.frame(model = c("Multi-T_bin_games", "Multi-T_bernoulli_sets", "Multi-T_negbin_sets", "Glicko-2"),
+                    average_test_acc = c(mean(multi_t_bin_games_accs$x), mean(multi_t_bernoulli_sets_accs$x), mean(multi_t_negbin_sets_accs$x), 
+                                         mean(glicko_accs)))
+acc_df %>%
+  arrange(desc(average_test_acc))
+
+# OR JUST USE THE ODDS DATA
+acc_df = test_out_odds %>%
+  group_by(model) %>%
+  summarize(acc = mean(pp_p1_match_win_prob > 0.5), n = n())
+acc_df = rbind(acc_df, c("Best_odds", mean(one_set_test$winner_implied_prob_best_odds > 0.5), nrow(one_set_test)))
+acc_df = rbind(acc_df, c("Average_odds", mean(one_set_test$winner_implied_prob_avg_odds > 0.5), nrow(one_set_test)))
+acc_df = rbind(acc_df, c("ATP Rankings", mean(one_set_test_matches$winner_rank < one_set_test_matches$loser_rank), nrow(one_set_test)))
+acc_df %>%
+  arrange(desc(acc))
+```
+
+We can also acquire train times to show the complexity of the model
+
+```{r}
+# Acquire train times
+multi_t_bin_games_train_times = as.vector(c(do.call(rbind, readRDS("./multi_t_models2/first22_multi_t_games_train_times.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/next38_multi_t_games_train_times.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/last32_multi_t_games_train_times.RData"))))
+                                                
+#multi_t_bin_sets_train_times = as.vector(do.call(rbind, readRDS("./multi_t_models/multi_t_sets_train_times.RData")))
+
+multi_t_bernoulli_sets_train_times = as.vector(do.call(rbind, readRDS("./multi_t_models3/bernoulli_sets_train_times.RData")))
+                                               
+multi_t_negbin_sets_train_times = as.vector(c(do.call(rbind, readRDS("./multi_t_models2/first22_multi_t_negbin_sets_train_times.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/next38_multi_t_negbin_sets_train_times.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/last32_multi_t_negbin_sets_train_times.RData"))))
+
+# multi_norm_bin_games_train_times = as.vector(do.call(rbind, readRDS("./multi_normal_models/multi_normal_games_train_times.RData")))
+# multi_norm_bin_sets_train_times = as.vector(do.call(rbind, readRDS("./multi_normal_models/multi_normal_sets_train_times.RData")))
+# multi_norm_negbin_sets_train_times = as.vector(do.call(rbind, readRDS("./multi_normal_models/multi_normal_negbin_sets_train_times.RData")))
+
+train_time_df = data.frame(model = rep(c("Multi-T_bin_games", "Multi-T_bernoulli_sets", "Multi-T_negbin_sets"), each = 92),
+                           train_time = c(multi_t_bin_games_train_times, multi_t_bernoulli_sets_train_times, multi_t_negbin_sets_train_times),
+                           month = rep(1:92, n_models-1))
+
+# Plot them
+ggplot(train_time_df, aes(month, train_time, color = model)) +
+  geom_line() +
+  scale_color_manual(labels = model.labs, values = c("purple", "navyblue", "red", "hotpink", "darkgreen", "orange")) +
+  labs(title = "Model train times", x = "month", y = "train time (s)")
+#ggsave("../manuscript/first_draft/images/model_train_times.png")
+```
+
+Let's make some posterior mean tables...
+
+```{r}
+# Only rate players with 5 matches played in last year
+match_data_365 = atp_match_dat %>% 
+  mutate(tourney_date = as.Date(tourney_date), days_passed_since_tourney = -(tourney_date - as.Date('2017-11-01'))) %>% 
+  filter(days_passed_since_tourney <= 365)
+n_matches_last_year = match_data_365 %>%
+  pivot_longer(., cols=c(winner_id, loser_id), names_to = "result", values_to = "player_id") %>%
+  group_by(player_id) %>%
+  summarize(n = n())
+players_to_rate =  n_matches_last_year %>%
+  filter(n >= 5) %>%
+  pull(player_id)
+
+# Grab top 10 at end of training
+top10 = wide_posterior_mean_frames %>%
+  filter(month == max(wide_posterior_mean_frames$month),
+         model == "Multi-T_bin_games",
+         player_id %in% players_to_rate) %>%
+  arrange(desc(posterior_mean_hard_skill)) %>%
+  select(player_id, full_name, posterior_mean_hard_skill, posterior_mean_clay_skill, posterior_mean_grass_skill) %>% head(10)
+
+top10
+```
+
+```{r}
+# Get their rankings
+rankings %>% filter(ranking_date == '2017-11-06') %>% arrange(rank) %>% filter(player %in% top10$player_id)
+```
+
+```{r}
+#Get top 10 clay players for each model
+posterior_mean_frames %>%
+  filter(skill_type == "clay_skill", month == "2017-11-01", player_id %in% players_to_rate) %>%
+  arrange(model, desc(posterior_mean)) %>%
+  group_by(model) %>%
+  mutate(rank = rank(-posterior_mean)) %>%
+  filter(rank <= 10)
+```
+
+
+```{r}
+# Plot distribution of posterior means for 3 models
+ggplot(wide_posterior_mean_frames %>% filter(month == "2017-11-01", model == "Multi-T_bin_games" | model == "Multi-T_bernoulli_sets" | model == "Multi-T_negbin_sets"), aes(posterior_mean_hard_skill, fill = model)) +
+  geom_density(alpha=0.4) +
+  xlim(-2, 2) +
+  ggtitle("Hard court posterior mean distributions") +
+  labs(x = 'posterior mean') +
+  scale_fill_manual(labels = c("1.(a)", "1.(b)", "1.(c)"), values = c("red", "green", "blue"))
+#ggsave("../manuscript/first_draft/images/posterior_mean_distn_by_model.png")
+```
+
+```{r}
+#overall_skills_by_surface = readRDS("./multi_normal_models/multi_normal_games_overall_skills_by_surface")
+
+# Get Nadal posterior for 1.(a)
+# ggplot(overall_skills_by_surface %>% filter(full_name == "Rafael Nadal")) +
+#   geom_density(aes(x=value, fill = skill_type), alpha = 0.5) + 
+#   ggtitle("Rafael Nadal Marginal Posteriors") +
+#   scale_fill_manual(values = c("red", "green", "blue"), labels = c("clay", "grass", "hard")) +
+#   labs(x = 'skill', fill = 'surface')
+#ggsave("../manuscript/first_draft/images/nadal_marginal_posteriors.png")
+```
+
+# Other parameters
+
+### R-hat
+
+```{r}
+multi_t_bin_games_skill_summaries =  readRDS("./multi_t_models2/last32_multi_t_games_skill_summaries.RData") %>% last()
+hist(multi_t_bin_games_skill_summaries$rhat)
+multi_t_bin_games_skill_summaries %>%
+  filter(grepl("beta", variable))
+multi_t_bin_games_skill_summaries %>%
+  filter(grepl("nu", variable))
+multi_t_bin_games_skill_summaries %>%
+  filter(grepl("Sigma", variable))
+
+
+#hist(do.call(rbind, multi_norm_sets_skill_summaries)$rhat)
+```
+
+```{r}
+multi_t_negbin_sets_skill_summaries = rbind(do.call(rbind, readRDS("./multi_t_models2/first22_multi_t_games_skill_summaries.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/next38_multi_t_games_skill_summaries.RData")),
+                                            do.call(rbind, readRDS("./multi_t_models2/last32_multi_t_games_skill_summaries.RData")))
+hist(multi_t_negbin_sets_skill_summaries$rhat)
+multi_t_negbin_sets_skill_summaries %>%
+  filter(grepl("beta", variable)) %>%
+  pull(mean) %>%
+  hist(., main = "Histogram of time-off covariate")
+multi_t_negbin_sets_skill_summaries %>%
+  filter(grepl("nu", variable)) %>%
+  pull(mean) %>%
+  hist(., main = "Histogram of degrees of freedom")
+multi_t_negbin_sets_skill_summaries %>%
+  filter(grepl("Sigma", variable))
+```
+
+### Set momentum in bernoulli sets model: Beta_2
+
+```{r}
+multi_t_bernoulli_sets_skill_summaries = do.call(rbind, readRDS("./multi_t_models3/bernoulli_sets_skill_summaries.RData"))
+multi_t_bernoulli_sets_skill_summaries %>%
+  filter(grepl("beta[2]", variable, fixed = T)) %>%
+  pull(mean) %>%
+  hist(., main = "Histogram of set-momentum covariate")
+```
+
+
