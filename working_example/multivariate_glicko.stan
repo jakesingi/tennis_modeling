@@ -37,7 +37,7 @@ transformed data {
 parameters {
   cholesky_factor_corr[3] Lcorr0;
   row_vector[3] alpha[J];  // player skills over the rating periods
-  real<lower=0> beta;  // how uncertainty grows as a player misses time
+  real beta;  // how uncertainty grows as a player misses time
   vector<lower=0>[3] tau;
 }
 transformed parameters {
@@ -52,6 +52,8 @@ model {
   Lcorr0 ~ lkj_corr_cholesky(1);
   tau ~ cauchy(0, 25);
   beta ~ normal(0, 25);
+  // NOTE: if you comment out the below `for` loop that samples the player skills `alpha`, and just use `alpha ~ multi_normal(Zero, Omega);`, 
+  // the model fits fine.
   for (i in 2:(N_train+1)) {
     for (j in 1:J) {
       if (z[i-1, j] == 1 && X_skill_time[i-1, j] > 0) { // Time-varying covariance for the two players participating in match i-1
@@ -61,8 +63,6 @@ model {
       }
     }
   }
-  // NOTE: if you comment out the above `for` loop that samples the player skills `alpha`, and just use `alpha ~ multi_normal(Zero, Omega);`, 
-  // the model fits fine.
   // Likelihood
   // Build up set win probability vector for each match
   vector[N_train] s;
