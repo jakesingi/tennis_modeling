@@ -1,10 +1,10 @@
 library(cmdstanr)
 
-# Number of matches: 114
-# Number of players: 15
+# Number of matches: 1,745
+# Number of players: 437
 
 # List with inputs to the model
-model_data = readRDS("model_data.RDS")
+model_data = readRDS("./model_data.RDS")
 
 # Fit the model
 fit = cmdstan_model("./multivariate_glicko.stan", cpp_options = list(stan_threads = TRUE))

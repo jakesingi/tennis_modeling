@@ -16,9 +16,11 @@ functions {
 data {
   int<lower=0> J;         // number of players
   int<lower=0> N_train;  // number of matches
-  matrix[N_train, J] z;  // indicator matrix where z[i,j] = 1 if player j participate in match i
+  matrix[N_train, J] z1;  // indicator matrix where z[i, j] = 1 if player j is player 1 in match i
+  matrix[N_train, J] z2;  // indicator matrix where z[i, j] = 1 if player j is player 2 in match i
   matrix[N_train, 3*J] X_skill;  // design matrix for player skills
-  matrix[N_train, J] X_skill_time;  // number of months between each player's last event and current event 
+  vector[N_train] X1;  // months passed since player 1 last played before match i 
+  vector[N_train] X2;  // months passed since player 2 last played before match i 
   int total_n[N_train];  // whether the match was best of 3 or 5 sets
   int winner_y[N_train];  // number of sets LOST by the winner of the match
 }
@@ -39,6 +41,8 @@ parameters {
   row_vector[3] alpha[J];  // player skills over the rating periods
   real beta;  // how uncertainty grows as a player misses time
   vector<lower=0>[3] tau;
+  vector[J] erratic;  // player's baseline erraticity (same across all court types)
+  matrix[N_train, 2] volatility;  // time dependent volatility of the two competing players that accounts for their baseline erraticity and "time off" for each match
 }
 transformed parameters {
   // define 3x3 correlation and covariance matrices
@@ -51,21 +55,15 @@ model {
   // Priors
   Lcorr0 ~ lkj_corr_cholesky(1);
   tau ~ cauchy(0, 25);
-  beta ~ normal(0, 25);
-  // NOTE: if you comment out the below `for` loop that samples the player skills `alpha`, and just use `alpha ~ multi_normal(Zero, Omega);`, 
-  // the model fits fine.
-  for (i in 2:(N_train+1)) {
-    for (j in 1:J) {
-      if (z[i-1, j] == 1 && X_skill_time[i-1, j] > 0) { // Time-varying covariance for the two players participating in match i-1
-        alpha[j] ~ multi_normal(Zero, quad_form_diag(O, tau + beta^2*X_skill_time[i-1, j]));
-      } else { // Otherwise use constant covariance
-        alpha[j] ~ multi_normal(Zero, Omega);
-      }
-    }
-  }
+  beta ~ normal(0, 1);
+  alpha ~ multi_normal(Zero, Omega);
+  erratic ~ normal(0, 1);
   // Likelihood
+  // Build up volatilities for each match
+  volatility[, 1] ~ normal(0, exp(beta .* X1 + z1 * erratic));
+  volatility[, 2] ~ normal(0, exp(beta .* X2 + z2 * erratic));
   // Build up set win probability vector for each match
   vector[N_train] s;
-  s = inv_logit(X_skill * to_vector(to_matrix(alpha)));
+  s = inv_logit(X_skill * to_vector(to_matrix(alpha)) + volatility[, 1] - volatility[, 2]);
   target += negbin_vec_lpmf(winner_y | s, r);
 }
